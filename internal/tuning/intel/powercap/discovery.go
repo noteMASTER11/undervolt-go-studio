@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
+	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning/sysfs"
 )
 
 func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
@@ -52,7 +53,13 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	capabilities := make([]tuning.Capability, 0, len(ids))
 	for _, id := range ids {
 		if sources := found[id]; len(sources) > 0 {
-			capabilities = append(capabilities, capabilityFor(id, sources))
+			capability := capabilityFor(id, sources)
+			var paths []string
+			for _, source := range sources {
+				paths = append(paths, source.path, source.maximumPath, root+"/"+source.zone+"/enabled")
+			}
+			capability.SourceRevision = sysfs.Revision(driver.store, paths...)
+			capabilities = append(capabilities, capability)
 		}
 	}
 	return capabilities, nil
@@ -96,11 +103,12 @@ func (driver *Driver) addSource(found map[tuning.ControlID][]constraint, id tuni
 		maximum = &parsed
 	}
 	found[id] = append(found[id], constraint{
-		path:    valuePath,
-		current: current,
-		maximum: maximum,
-		scale:   scale,
-		zone:    zone,
+		path:        valuePath,
+		maximumPath: maximumPath,
+		current:     current,
+		maximum:     maximum,
+		scale:       scale,
+		zone:        zone,
 	})
 }
 
@@ -133,9 +141,13 @@ func capabilityFor(id tuning.ControlID, sources []constraint) tuning.Capability 
 	case tuning.ControlTau:
 		capability.Label, capability.Unit = "Turbo time window", tuning.UnitSecond
 	}
-	if hasMaximum && !math.IsInf(maximum, 1) {
+	if id == tuning.ControlTau {
+		capability.ReasonCode = "time_resolution_unverified"
+		capability.Reason = "The kernel reports microseconds, but not the representable time windows; editing is disabled"
+	} else if hasMaximum && !math.IsInf(maximum, 1) {
 		capability.State = tuning.StateSupported
-		capability.Range = &tuning.NumericRange{Minimum: 0, Maximum: maximum, Step: 1 / sources[0].scale}
+		// Practical review increments; actual firmware read-back must still match.
+		capability.Range = &tuning.NumericRange{Minimum: 0, Maximum: maximum, Step: 1}
 	} else {
 		capability.ReasonCode = "unknown_upper_bound"
 		capability.Reason = "The kernel does not report a writable upper bound"

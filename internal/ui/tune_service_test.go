@@ -151,6 +151,7 @@ type fakeTuneSession struct {
 	closes        int
 	revertStarted chan struct{}
 	revertRelease chan struct{}
+	closeErr      error
 }
 
 func (*fakeTuneSession) Apply(context.Context, tuning.ChangeSet) (protocol.AppliedPayload, error) {
@@ -175,7 +176,65 @@ func (session *fakeTuneSession) Close(context.Context) error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.closes++
-	return nil
+	return session.closeErr
+}
+
+type eventTuneSession struct {
+	fakeTuneSession
+	stream chan tuning.Event
+}
+
+func (session *eventTuneSession) Events() <-chan tuning.Event { return session.stream }
+
+func TestDesktopTuneServiceForwardsTerminationAndDropsDeadClient(t *testing.T) {
+	client := &eventTuneSession{stream: make(chan tuning.Event, 1)}
+	service := &desktopTuneService{dial: func(context.Context, string) (tuneSession, tuning.CapabilitySet, error) {
+		return client, tuning.CapabilitySet{Generation: "g"}, nil
+	}}
+	stream := service.Events()
+	if _, err := service.Apply(context.Background(), tuning.ChangeSet{Generation: "g"}); err != nil {
+		t.Fatal(err)
+	}
+	if event := <-stream; event.Kind != "transaction_applied" {
+		t.Fatalf("initial event=%+v", event)
+	}
+	client.stream <- tuning.Event{Kind: "session_terminated", Message: "Lost helper"}
+	close(client.stream)
+	select {
+	case event := <-stream:
+		if event.Kind != "session_terminated" {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("termination discarded")
+	}
+	service.mu.Lock()
+	cached := service.client
+	service.mu.Unlock()
+	if cached != nil {
+		t.Fatal("dead client retained for next apply")
+	}
+}
+
+func TestDesktopTuneServiceRetainsClientOnIncompleteClose(t *testing.T) {
+	client := &fakeTuneSession{closeErr: &tuning.RollbackError{Cause: errors.New("restore failed")}}
+	service := &desktopTuneService{client: client}
+	if err := service.Close(context.Background()); err == nil {
+		t.Fatal("close failure discarded")
+	}
+	service.mu.Lock()
+	cached, closed := service.client, service.closed
+	service.mu.Unlock()
+	if cached != client || closed {
+		t.Fatal("rollback retry lost after close failure")
+	}
+}
+
+func TestDesktopCloseDoesNotDiscardRecoveryAfterHelperLoss(t *testing.T) {
+	service := &desktopTuneService{recoveryNeeded: true}
+	if err := service.Close(context.Background()); err == nil {
+		t.Fatal("window could close with unverified recovery")
+	}
 }
 
 func (session *fakeTuneSession) closeCount() int {

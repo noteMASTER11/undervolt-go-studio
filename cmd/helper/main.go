@@ -39,6 +39,11 @@ func run() error {
 		return errors.New("helper: interactive TTY sessions are not allowed")
 	}
 
+	lock, err := (tuning.FileRecoveryStore{}).Lock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	identity, err := intel.DetectIdentity()
 	if err != nil {
 		return err
@@ -71,7 +76,16 @@ func run() error {
 		drivers...,
 	)
 	engine.BootID = string(bytesTrimSpace(bootIDRaw))
-	backend := &helperBackend{discoverer: discoverer, engine: engine}
+	backend := &helperBackend{discoverer: discoverer, engine: engine, checkIdentity: func() error {
+		current, err := intel.DetectIdentity()
+		if err != nil {
+			return err
+		}
+		if current != identity {
+			return errors.New("processor identity changed; restart the tuning session")
+		}
+		return nil
+	}}
 	server := session.NewServer(backend)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
@@ -83,8 +97,9 @@ func run() error {
 }
 
 type helperBackend struct {
-	discoverer *tuning.Discoverer
-	engine     *tuning.Engine
+	discoverer    *tuning.Discoverer
+	engine        *tuning.Engine
+	checkIdentity func() error
 }
 
 func (backend *helperBackend) Recover(ctx context.Context) (tuning.RecoveryResult, error) {
@@ -92,6 +107,11 @@ func (backend *helperBackend) Recover(ctx context.Context) (tuning.RecoveryResul
 }
 
 func (backend *helperBackend) Probe(ctx context.Context) (tuning.CapabilitySet, error) {
+	if backend.checkIdentity != nil {
+		if err := backend.checkIdentity(); err != nil {
+			return tuning.CapabilitySet{}, err
+		}
+	}
 	var final tuning.DiscoveryResult
 	for result := range backend.discoverer.Discover(ctx) {
 		final = result
@@ -104,7 +124,11 @@ func (backend *helperBackend) Probe(ctx context.Context) (tuning.CapabilitySet, 
 }
 
 func (backend *helperBackend) Apply(ctx context.Context, changes tuning.ChangeSet) (session.Transaction, tuning.ValidationResult, error) {
-	return backend.engine.Apply(ctx, changes)
+	active, validation, err := backend.engine.Apply(ctx, changes)
+	if active == nil {
+		return nil, validation, err
+	}
+	return active, validation, err
 }
 
 func bytesTrimSpace(value []byte) []byte {

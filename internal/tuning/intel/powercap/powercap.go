@@ -13,11 +13,12 @@ import (
 const root = "sys/class/powercap"
 
 type constraint struct {
-	path    string
-	current int64
-	maximum *int64
-	scale   float64
-	zone    string
+	maximumPath string
+	path        string
+	current     int64
+	maximum     *int64
+	scale       float64
+	zone        string
 }
 
 type Driver struct {
@@ -36,6 +37,9 @@ func (driver *Driver) ID() string {
 }
 
 func (driver *Driver) Prepare(ctx context.Context, change tuning.Change) (tuning.PreparedOperation, error) {
+	if change.ID == tuning.ControlTau {
+		return nil, fmt.Errorf("powercap: representable time windows are unverified")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

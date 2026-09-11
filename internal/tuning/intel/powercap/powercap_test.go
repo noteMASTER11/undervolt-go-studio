@@ -38,6 +38,39 @@ func TestProbeCombinesMSRAndMMIOPackageConstraints(t *testing.T) {
 	if pl1.State != tuning.StateSupported {
 		t.Fatalf("PL1 state = %q", pl1.State)
 	}
+	if pl1.Range.Step != 1 {
+		t.Fatalf("sysfs units advertised as target resolution: %+v", pl1.Range)
+	}
+	tau := capabilityByID(t, caps, tuning.ControlTau)
+	if tau.State != tuning.StateReadOnly || tau.Range != nil {
+		t.Fatalf("unproved time resolution advertised writable: %+v", tau)
+	}
+}
+
+func TestGenerationChangesWhenHiddenPowercapSourceChanges(t *testing.T) {
+	store := powercapStore(map[string]string{
+		"intel-rapl:0/name": "package-0", "intel-rapl:0/constraint_0_name": "long_term",
+		"intel-rapl:0/constraint_0_power_limit_uw": "44000000", "intel-rapl:0/constraint_0_max_power_uw": "55000000",
+		"intel-rapl-mmio:0/name": "package-0", "intel-rapl-mmio:0/constraint_0_name": "long_term",
+		"intel-rapl-mmio:0/constraint_0_power_limit_uw": "45000000", "intel-rapl-mmio:0/constraint_0_max_power_uw": "55000000",
+	})
+	d := tuning.NewDiscoverer("cpu", New(store))
+	probe := func() tuning.CapabilitySet {
+		var set tuning.CapabilitySet
+		for r := range d.Discover(context.Background()) {
+			set = r.Set
+		}
+		return set
+	}
+	before := probe()
+	store.Files[root+"/intel-rapl-mmio:0/constraint_0_power_limit_uw"] = []byte("46000000")
+	after := probe()
+	if before.Generation == after.Generation {
+		t.Fatal("hidden source drift kept reviewed generation")
+	}
+	if before.Capabilities[0].Current.Number != after.Capabilities[0].Current.Number {
+		t.Fatal("fixture changed visible effective value")
+	}
 }
 
 func TestProbeMapsShortTermByNameAndTreatsZeroMaximumAsUnknown(t *testing.T) {

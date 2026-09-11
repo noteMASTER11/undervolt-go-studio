@@ -2,6 +2,9 @@ package pages
 
 import (
 	"context"
+	"image/png"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +12,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
@@ -24,6 +28,53 @@ func TestTunePageUsesWorkbenchGroupsAndPendingRail(t *testing.T) {
 		if !page.HasSection(label) {
 			t.Fatalf("missing %q", label)
 		}
+	}
+	if title := page.liveCards["frequency"].Object().(*widget.Card).Title; title != "CPU maximum" {
+		t.Fatalf("unclassified frequency mislabeled %q", title)
+	}
+}
+
+func TestTuneRendersVerifiedResultsAndRecoveryActions(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+	page := NewTuneWithDispatcher(viewmodel.NewTune(emptyTuneService{}), nil, telemetry.Catalog{}, immediateDispatch)
+	state := viewmodel.TuneState{Phase: viewmodel.PhaseActive, SessionActive: true, Capabilities: capabilitySetForPage(), Pending: []tuning.Change{{ID: tuning.ControlPL1, Requested: tuning.NumericValue(40)}}, Effective: map[tuning.ControlID]tuning.Value{tuning.ControlPL1: tuning.NumericValue(39.5)}}
+	page.render(state)
+	if !strings.Contains(page.results.Text, "Requested 40.00") || !strings.Contains(page.results.Text, "Verified 39.50") {
+		t.Fatalf("requested/effective distinction missing: %q", page.results.Text)
+	}
+	captureTuneOutcome(t, page, "tune-active.png")
+	state.Phase = viewmodel.PhaseRollbackIncomplete
+	state.Remaining = state.Effective
+	state.LastError = "Stock restoration incomplete"
+	page.render(state)
+	if !page.recovery.Visible() || page.retry.Disabled() || page.reboot.Disabled() || !strings.Contains(page.results.Text, "Verified remaining") {
+		t.Fatal("incomplete rollback lost persistent recovery controls")
+	}
+	captureTuneOutcome(t, page, "tune-rollback-incomplete.png")
+	page.Object().Resize(fyne.NewSize(1600, 1000))
+	if page.recovery.Position().Y < page.results.Position().Y+page.results.Size().Height {
+		t.Fatal("recovery actions overlap verified outcome instead of following it")
+	}
+}
+
+// Optional headless visual QA uses only Fyne's in-memory test canvas.
+func captureTuneOutcome(t *testing.T, page *Tune, name string) {
+	t.Helper()
+	directory := os.Getenv("STUDIO_TUNE_QA_DIR")
+	if directory == "" {
+		return
+	}
+	window := test.NewWindow(page.Object())
+	defer window.Close()
+	window.Resize(fyne.NewSize(1600, 1000))
+	file, err := os.Create(filepath.Join(directory, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := png.Encode(file, window.Canvas().Capture()); err != nil {
+		t.Fatal(err)
 	}
 }
 

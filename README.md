@@ -28,7 +28,7 @@ Hardware summarizes the system, processor, graphics, memory, storage, and teleme
 
 ![Tune screen](docs/images/studio-tune.png)
 
-Tune discovers only verified capabilities, stages changes locally, and requires review before authorization. Unsupported or firmware-locked controls remain explicit and read-only.
+Tune stages changes locally and requires review before authorization. Applied results show Requested and Verified values. Unsupported controls remain visible with an explanation. The screenshots use deterministic demonstration values, not a hardware-validation result.
 
 ## Capability status
 
@@ -36,19 +36,23 @@ Tune discovers only verified capabilities, stages changes locally, and requires 
 | --- | --- | --- |
 | Overview, Monitor, and Hardware telemetry | Implemented | Normal-user GUI with visible-page subscriptions. |
 | Tune staging, review, temporary apply, and rollback | Implemented | Semantic controls, read-back verification, and a short-lived helper session. |
-| PL1, PL2, Tau, EPP, TCC, P-core ratios, and voltage offsets | Hardware-dependent | Shown only when the reviewed kernel or model-specific interface proves support. |
-| E-core ratios and firmware-locked voltage controls | Read-only | No guessed register layout or writable zero-value is presented. |
+| PL1, PL2, EPP, and TCC | Hardware-dependent | Kernel-backed controls; power targets use practical 1 W review increments and require exact read-back. |
+| Turbo time window (Tau) | Read-only | Sysfs microseconds do not establish the hardware's representable time windows. |
+| P-core ratios and core/cache voltage offsets | Read-only | Writability, lock state, and stock restoration cannot yet be established safely, including on the 275HX. Tested codecs do not authorize production writes. |
+| E-core ratios | Read-only | The register layout remains unverified. |
 | Stress Tests, Profiles, Reports, GPU telemetry, and packaged releases | Planned | These are not complete in the current Studio milestone. |
 
 ## Temporary tuning safety
 
-Temporary tuning is staged first and changes nothing until review confirmation starts the fixed helper command. The helper captures a stock snapshot, applies supported values conservatively, verifies read-back, and rolls back on explicit revert, GUI close, pipe loss, lease expiry, or a transaction failure.
+Temporary tuning is staged first and changes nothing until review confirmation starts the fixed helper command. One helper or mutating harness owns the recovery lock at a time. The helper saves recovery state before writes, checks capability drift immediately before applying, verifies read-back, and attempts rollback on explicit revert, GUI close, pipe loss, lease expiry, or a transaction failure.
+
+Incomplete restoration stays visible with verified remaining values (or an explicit unverified state), Retry rollback / recovery, and reboot guidance. Closing the window stops if restoration cannot be confirmed. An unresolved recovery record blocks new tuning; records from another boot require an audit instead of replaying volatile settings.
 
 A kernel panic, power loss, or hard lock cannot be repaired by a running user-space process. If the machine hard-locks, reboot is the recovery path; volatile MSR settings are expected to reset, and the next helper session rechecks kernel-backed controls before another apply.
 
 ## Supported environment and 275HX validation
 
-Studio targets Linux systems with the kernel interfaces needed by each advertised capability. The current validation target is the Intel Core Ultra 9 275HX (GenuineIntel family 6, model `0xC6`, stepping 2). The recorded read-only probe confirms the available controls and intentionally reports unavailable or locked interfaces without inventing values. Mutating validation remains an opt-in developer procedure, not a release claim.
+Studio targets Linux systems with the kernel interfaces needed by each advertised capability. The current validation target is the Intel Core Ultra 9 275HX (GenuineIntel family 6, model `0xC6`, stepping 2). The recorded read-only probe establishes interface availability; it does not prove voltage writability, firmware lock state, or safe hardware restoration. No hardware mutation was performed for the final safety fixes. Mutating validation remains an opt-in developer procedure, not a release claim.
 
 ## Build and run
 

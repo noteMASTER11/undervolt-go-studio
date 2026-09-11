@@ -97,6 +97,13 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 		return err
 	}
 
+	if config.Mutate {
+		lock, err := (tuning.FileRecoveryStore{}).Lock()
+		if err != nil {
+			return err
+		}
+		defer lock.Close()
+	}
 	store := sysfs.RootStore{Root: "/"}
 	topology, topologyErr := intel.DetectTopology(store, intel.CPUIDOnCPU)
 	drivers := systemDrivers(store, identity, topology)

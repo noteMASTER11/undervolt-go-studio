@@ -2,6 +2,7 @@ package msr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -32,6 +33,79 @@ func TestDriverUnknownModelReturnsDisabledControlsWithoutDeviceAccess(t *testing
 	}
 }
 
+func TestProductionDriverCannotAuthorizeUnprovedWrites(t *testing.T) {
+	device := newSemanticMSRDevice(0x2f30313233343536)
+	device.lockVoltage = true
+	driver := NewDriver(device, targetIdentity(), 8)
+	caps, err := driver.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []tuning.ControlID{tuning.ControlRatioPCore, tuning.ControlVoltageCore, tuning.ControlVoltageCache} {
+		cap := findCapability(t, caps, id)
+		if cap.State != tuning.StateReadOnly || cap.ReasonCode == "" {
+			t.Errorf("unproved write advertised: %+v", cap)
+		}
+		value := tuning.NumericValue(-10)
+		if id == tuning.ControlRatioPCore {
+			value = tuning.VectorValue([]float64{53, 52, 51, 50, 49, 48, 47, 46})
+		}
+		if _, err := driver.Prepare(context.Background(), tuning.Change{ID: id, Requested: value}); err == nil {
+			t.Errorf("unproved %s write authorized", id)
+		}
+	}
+	if device.writes != 0 {
+		t.Errorf("discovery issued %d mailbox writes despite unproved eligibility", device.writes)
+	}
+}
+
+type unrestorableVoltageDevice struct{ *semanticMSRDevice }
+
+func (device unrestorableVoltageDevice) Read(cpu int, register uint32) (uint64, error) {
+	if register == registerOCMailbox {
+		return uint64(1) << 21, nil
+	} // +0.9765625 mV cannot be restored by this milestone.
+	return device.semanticMSRDevice.Read(cpu, register)
+}
+
+func TestVoltageCaptureRejectsStockOutsideRestorePolicy(t *testing.T) {
+	device := unrestorableVoltageDevice{newSemanticMSRDevice(0)}
+	op := &voltageOperation{device: device, plane: PlaneCore, requested: -10}
+	if _, err := op.Capture(context.Background()); err == nil {
+		t.Fatal("unrestorable positive stock accepted")
+	}
+}
+
+func TestRecoveryRestoreRejectsInvalidSnapshotsBeforeDeviceAccess(t *testing.T) {
+	for _, id := range []tuning.ControlID{tuning.ControlVoltageCore, tuning.ControlVoltageCache, tuning.ControlRatioPCore} {
+		inputs := []string{"null", "{}", "0", "1"}
+		if id != tuning.ControlRatioPCore {
+			inputs = []string{"null", "{}", "1", "-251", "-0.1"}
+		}
+		for _, raw := range inputs {
+			t.Run(string(id)+"/"+raw, func(t *testing.T) {
+				device := newSemanticMSRDevice(0x2f30313233343536)
+				driver := NewDriver(device, targetIdentity(), 8)
+				if _, err := driver.Restore(context.Background(), id, json.RawMessage(raw)); err == nil {
+					t.Error("invalid snapshot accepted")
+				}
+				if device.reads != 0 || device.writes != 0 {
+					t.Fatalf("invalid snapshot touched device: reads=%d writes=%d", device.reads, device.writes)
+				}
+			})
+		}
+	}
+}
+
+func TestRecoveryRestoreRequiresReviewedRatioTopology(t *testing.T) {
+	device := newSemanticMSRDevice(0x2f30313233343536)
+	driver := NewDriver(device, targetIdentity(), 4)
+	raw, _ := json.Marshal(device.ratio)
+	if _, err := driver.Restore(context.Background(), tuning.ControlRatioPCore, raw); err == nil || device.writes != 0 {
+		t.Fatalf("unreviewed topology restored: err=%v writes=%d", err, device.writes)
+	}
+}
+
 func TestRatioOperationLowersAndRestoresFullRegister(t *testing.T) {
 	original := uint64(0x2f30313233343536)
 	device := newSemanticMSRDevice(original)
@@ -40,13 +114,7 @@ func TestRatioOperationLowersAndRestoresFullRegister(t *testing.T) {
 	if _, err := driver.Probe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	op, err := driver.Prepare(context.Background(), tuning.Change{
-		ID:        tuning.ControlRatioPCore,
-		Requested: tuning.VectorValue([]float64{53, 52, 51, 50, 49, 48, 47, 46}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	op := &ratioOperation{device: device, register: registerTurboRatioLimit, count: 8, requested: []float64{53, 52, 51, 50, 49, 48, 47, 46}}
 	raw, err := op.Capture(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -73,13 +141,7 @@ func TestVoltageOperationStepsAndRestoresAfterFailure(t *testing.T) {
 	if _, err := driver.Probe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	op, err := driver.Prepare(context.Background(), tuning.Change{
-		ID:        tuning.ControlVoltageCore,
-		Requested: tuning.NumericValue(-35),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	op := &voltageOperation{device: device, plane: PlaneCore, requested: -35}
 	if _, err := op.Capture(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -99,14 +161,11 @@ func TestVoltageOperationClassifiesFirmwareLock(t *testing.T) {
 	if _, err := driver.Probe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	op, err := driver.Prepare(context.Background(), tuning.Change{ID: tuning.ControlVoltageCore, Requested: tuning.NumericValue(-10)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	op := &voltageOperation{device: device, plane: PlaneCore, requested: -10}
 	if _, err := op.Capture(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	_, err = op.Apply(context.Background())
+	_, err := op.Apply(context.Background())
 	var reason *ReasonError
 	if !errors.As(err, &reason) || reason.Code != ReasonVoltageLocked {
 		t.Fatalf("err = %v", err)
@@ -119,15 +178,9 @@ func TestRatioReadBackMismatchRequestsRollback(t *testing.T) {
 	if _, err := driver.Probe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	op, err := driver.Prepare(context.Background(), tuning.Change{
-		ID:        tuning.ControlRatioPCore,
-		Requested: tuning.VectorValue([]float64{53, 52, 51, 50, 49, 48, 47, 46}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	op := &ratioOperation{device: device, register: registerTurboRatioLimit, count: 8, requested: []float64{53, 52, 51, 50, 49, 48, 47, 46}}
 	device.clampRatio = true
-	_, err = op.Apply(context.Background())
+	_, err := op.Apply(context.Background())
 	var mismatch *ReadBackMismatchError
 	if !errors.As(err, &mismatch) {
 		t.Fatalf("err = %v", err)
@@ -155,6 +208,7 @@ type semanticMSRDevice struct {
 	reads            int
 	writes           int
 	voltageWrites    int
+	voltageSequence  []float64
 	failVoltageWrite int
 	lockVoltage      bool
 	clampRatio       bool
@@ -189,6 +243,7 @@ func (device *semanticMSRDevice) Write(_ int, register uint32, value uint64) err
 		device.pendingPlane = VoltagePlane((value >> 40) & 0xff)
 		if value&(uint64(1)<<32) != 0 {
 			device.voltageWrites++
+			device.voltageSequence = append(device.voltageSequence, DecodeVoltageOffset(uint32(value)))
 			if device.failVoltageWrite > 0 && device.voltageWrites == device.failVoltageWrite {
 				device.failVoltageWrite = 0
 				return errors.New("injected voltage failure")

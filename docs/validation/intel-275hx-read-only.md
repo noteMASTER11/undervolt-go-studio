@@ -3,6 +3,12 @@
 Date: 2026-09-11 (Asia/Tbilisi)
 Verification baseline: `241f515ac21a415403176bae19daba5b875e4a11` (`fix: hydrate drivers before smoke recovery`)
 
+## Final safety-wave update
+
+The sections below record the earlier baseline, not current writable capability claims. The final safety wave based on `fa1c7bc` repeated the default read-only probe at 22:08:01 +04:00 on the same date, with exit 0 and no hardware mutation. PL1 remains 44 W with a 55 W maximum, now using practical 1 W review increments; PL2 remains read-only at 44 W because its upper bound is unknown. Tau is now unconditionally read-only because representable time-window resolution is unverified, independently of whether bounds are present. TCC remains 95 °C and EPP remains `default` with the same reported choices.
+
+P-core ratio discovery may read the strictly allow-listed register, but never authorizes new ratio writes; the normal-user probe remains `kernel_blocked`. Core/cache voltage discovery is now read-only with unknown values and an explicit unverified-writability reason. It does not issue even a mailbox read command, which would itself require an MSR write. No safe writability/lock/stock-restoration probe has been established. The deterministic screenshot now uses read-only ratio/voltage capabilities, not the historical supported-ratio/firmware-lock illustration below. New MSR Apply is disabled in production; only restoration of an existing durable, same-machine/same-boot snapshot remains available under the exclusive recovery lock.
+
 ## Host and CPUID
 
 - Kernel: `Linux 7.2.3-1-cachyos x86_64 GNU/Linux`

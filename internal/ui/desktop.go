@@ -7,6 +7,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/dialog"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/providers/linuxfs"
@@ -19,6 +20,7 @@ type Desktop struct {
 	scheduler *telemetry.Scheduler
 
 	mu        sync.Mutex
+	closeMu   sync.Mutex
 	context   context.Context
 	cancel    context.CancelFunc
 	window    fyne.Window
@@ -60,7 +62,7 @@ func (d *Desktop) Build(application fyne.App) fyne.Window {
 		beginWindowClose(d.Close, fyne.Do, func() {
 			window.SetCloseIntercept(nil)
 			window.Close()
-		})
+		}, func(err error) { dialog.ShowError(err, window) })
 	})
 	return d.window
 }
@@ -73,8 +75,7 @@ func (d *Desktop) Run() error {
 	window.Show()
 	d.start()
 	application.Run()
-	d.Close()
-	return nil
+	return d.Close()
 }
 
 func (d *Desktop) start() {
@@ -106,17 +107,14 @@ func (d *Desktop) start() {
 }
 
 // Close stops subscriptions and cancels all provider work. It is safe to call repeatedly.
-func (d *Desktop) Close() {
+func (d *Desktop) Close() error {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
 	d.mu.Lock()
 	if d.closed {
-		done := d.closeDone
 		d.mu.Unlock()
-		if done != nil {
-			<-done
-		}
-		return
+		return nil
 	}
-	d.closed = true
 	if d.closeDone == nil {
 		d.closeDone = make(chan struct{})
 	}
@@ -124,20 +122,29 @@ func (d *Desktop) Close() {
 	cancel := d.cancel
 	shell := d.shell
 	d.mu.Unlock()
-	defer close(done)
 
 	if shell != nil {
-		_ = shell.CloseTune()
+		if err := shell.CloseTune(); err != nil {
+			return err
+		}
 		shell.Deactivate()
 	}
 	if cancel != nil {
 		cancel()
 	}
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	close(done)
+	return nil
 }
 
-func beginWindowClose(work func(), dispatch func(func()), finish func()) {
+func beginWindowClose(work func() error, dispatch func(func()), finish func(), failed func(error)) {
 	go func() {
-		work()
+		if err := work(); err != nil {
+			dispatch(func() { failed(err) })
+			return
+		}
 		dispatch(finish)
 	}()
 }

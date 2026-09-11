@@ -37,8 +37,20 @@ type ActiveTransaction struct {
 	record     RecoveryRecord
 	operations []transactionOperation
 
-	mu       sync.Mutex
-	finished bool
+	mu        sync.Mutex
+	finished  bool
+	effective map[ControlID]Value
+}
+
+func (active *ActiveTransaction) Effective() map[ControlID]Value {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	values := make(map[ControlID]Value, len(active.effective))
+	for id, value := range active.effective {
+		value.Vector = append([]float64(nil), value.Vector...)
+		values[id] = value
+	}
+	return values
 }
 
 func (active *ActiveTransaction) ID() string {
@@ -88,26 +100,30 @@ func (engine *Engine) Apply(ctx context.Context, changes ChangeSet) (*ActiveTran
 		CreatedAt:     time.Now(),
 		Entries:       entriesFromOperations(operations),
 	}
-	active := &ActiveTransaction{engine: engine, record: record, operations: operations}
+	active := &ActiveTransaction{engine: engine, record: record, operations: operations, effective: make(map[ControlID]Value)}
 	if err := engine.Recovery.Save(record); err != nil {
 		return nil, validation, fmt.Errorf("transaction: save recovery record: %w", err)
 	}
 	for index := range active.operations {
-		if _, err := active.operations[index].operation.Apply(ctx); err != nil {
-			rollbackErr := active.rollbackUnlocked(context.WithoutCancel(ctx))
-			return nil, validation, errors.Join(fmt.Errorf("transaction: apply %s: %w", active.operations[index].entry.ControlID, err), rollbackErr)
-		}
+		// Applied means possibly modified, including a successful write whose
+		// read-back failed or whose process died before recording the result.
 		active.operations[index].entry.Applied = true
 		active.record.Entries[index].Applied = true
 		if err := engine.Recovery.Save(active.record); err != nil {
 			rollbackErr := active.rollbackUnlocked(context.WithoutCancel(ctx))
-			return nil, validation, errors.Join(fmt.Errorf("transaction: persist applied state: %w", err), rollbackErr)
+			return unfinished(active), validation, errors.Join(fmt.Errorf("transaction: persist applied state: %w", err), rollbackErr)
 		}
+		effective, err := active.operations[index].operation.Apply(ctx)
+		if err != nil {
+			rollbackErr := active.rollbackUnlocked(context.WithoutCancel(ctx))
+			return unfinished(active), validation, errors.Join(fmt.Errorf("transaction: apply %s: %w", active.operations[index].entry.ControlID, err), rollbackErr)
+		}
+		active.effective[active.operations[index].entry.ControlID] = effective
 	}
 	active.record.State = "active"
 	if err := engine.Recovery.Save(active.record); err != nil {
 		rollbackErr := active.rollbackUnlocked(context.WithoutCancel(ctx))
-		return nil, validation, errors.Join(fmt.Errorf("transaction: persist active state: %w", err), rollbackErr)
+		return unfinished(active), validation, errors.Join(fmt.Errorf("transaction: persist active state: %w", err), rollbackErr)
 	}
 	return active, validation, nil
 }
@@ -143,13 +159,68 @@ func (active *ActiveTransaction) rollbackUnlocked(ctx context.Context) error {
 	if rollbackErr != nil {
 		active.record.State = "rollback_incomplete"
 		_ = active.engine.Recovery.Save(active.record)
-		return rollbackErr
+		return active.rollbackError(ctx, rollbackErr)
 	}
 	if err := active.engine.Recovery.Remove(); err != nil {
-		return err
+		return active.rollbackError(ctx, err)
 	}
 	active.finished = true
 	return nil
+}
+
+func unfinished(active *ActiveTransaction) *ActiveTransaction {
+	if active.finished {
+		return nil
+	}
+	return active
+}
+
+// RollbackError retains verified readings separately from controls that could
+// not be read. A last requested/applied value is never a verified remaining one.
+type RollbackError struct {
+	Remaining  map[ControlID]Value
+	Unverified []ControlID
+	Cause      error
+}
+
+func (err *RollbackError) Error() string {
+	return "Stock restoration is incomplete; retry rollback or reboot to reset temporary settings"
+}
+func (err *RollbackError) Unwrap() error { return err.Cause }
+
+func (active *ActiveTransaction) rollbackError(ctx context.Context, cause error) error {
+	result := &RollbackError{Remaining: make(map[ControlID]Value), Cause: cause}
+	for _, operation := range active.operations {
+		if !operation.entry.Applied {
+			continue
+		}
+		id := operation.entry.ControlID
+		if reader, ok := operation.operation.(interface {
+			Remaining(context.Context) (Value, error)
+		}); ok {
+			value, err := reader.Remaining(ctx)
+			if err == nil && value.Kind != "" {
+				result.Remaining[id] = value
+			} else {
+				result.Unverified = append(result.Unverified, id)
+			}
+			continue
+		}
+		capabilities, err := active.engine.Drivers[operation.entry.DriverID].Probe(ctx)
+		found := false
+		if err == nil {
+			for _, cap := range capabilities {
+				if cap.ID == id && cap.Current.Kind != "" {
+					result.Remaining[id] = cap.Current
+					found = true
+				}
+			}
+		}
+		if !found {
+			result.Unverified = append(result.Unverified, id)
+		}
+	}
+	return result
 }
 
 type RecoveryResult struct {

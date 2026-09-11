@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -38,14 +39,16 @@ type desktopTuneService struct {
 	dial       tuneDial
 	eventStore *events.Store
 
-	applyMu     sync.Mutex
-	mu          sync.Mutex
-	client      tuneSession
-	privileged  tuning.CapabilitySet
-	transaction string
-	applyCancel context.CancelFunc
-	applyDone   chan struct{}
-	closed      bool
+	applyMu        sync.Mutex
+	mu             sync.Mutex
+	client         tuneSession
+	privileged     tuning.CapabilitySet
+	transaction    string
+	applyCancel    context.CancelFunc
+	applyDone      chan struct{}
+	closed         bool
+	eventStream    chan tuning.Event
+	recoveryNeeded bool
 }
 
 func newDesktopTuneService(build string, eventStore *events.Store) *desktopTuneService {
@@ -153,12 +156,27 @@ func (service *desktopTuneService) Apply(ctx context.Context, changes tuning.Cha
 		service.privileged = capabilities
 		client = connected
 		service.mu.Unlock()
+		service.watchSession(connected)
 		if capabilities.Generation != changes.Generation {
 			return service.publish(tuning.Event{Kind: "review_changed", Message: "Privileged capability check changed the review", Capabilities: &capabilities}), nil
 		}
 	}
 	applied, err := client.Apply(operationContext, changes)
 	if err != nil {
+		var changed *privilegeclient.ReviewChangedError
+		if errors.As(err, &changed) {
+			service.mu.Lock()
+			service.privileged = changed.Capabilities
+			service.mu.Unlock()
+			return service.publish(tuning.Event{Kind: "review_changed", Capabilities: &changed.Capabilities, Message: changed.Error()}), nil
+		}
+		var incomplete *tuning.RollbackError
+		if errors.As(err, &incomplete) {
+			return service.publish(tuning.Event{Kind: "rollback_incomplete", Message: incomplete.Error(), Remaining: incomplete.Remaining, Unverified: incomplete.Unverified}), nil
+		}
+		if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return service.publish(tuning.Event{Kind: "session_terminated", Message: "Helper connection lost; stock restoration could not be verified. Retry recovery or reboot."}), nil
+		}
 		return nil, err
 	}
 	service.mu.Lock()
@@ -170,9 +188,14 @@ func (service *desktopTuneService) Apply(ctx context.Context, changes tuning.Cha
 		closeTuneSession(client)
 		return nil, ErrTuningClosed
 	}
+	if service.client != client {
+		service.mu.Unlock()
+		return service.publish(tuning.Event{Kind: "session_terminated", Message: "Helper connection lost; retry recovery or reboot."}), nil
+	}
 	service.transaction = applied.TransactionID
+	stream := service.publishLocked(tuning.Event{Kind: "transaction_applied", Message: "Temporary tuning session is active", Effective: applied.Effective})
 	service.mu.Unlock()
-	return service.publish(tuning.Event{Kind: "transaction_applied", Message: "Temporary tuning session is active", Effective: applied.Effective}), nil
+	return stream, nil
 }
 
 func (service *desktopTuneService) Revert(ctx context.Context) error {
@@ -203,6 +226,25 @@ func (service *desktopTuneService) Revert(ctx context.Context) error {
 		service.mu.Unlock()
 	}()
 	if client == nil {
+		service.mu.Lock()
+		needsRecovery := service.recoveryNeeded
+		service.mu.Unlock()
+		if !needsRecovery {
+			return nil
+		}
+		if service.dial == nil {
+			return errors.New("Recovery requires restarting the installed helper")
+		}
+		recovered, _, err := service.dial(operationContext, service.build)
+		if err != nil {
+			return err
+		}
+		if err := recovered.Close(operationContext); err != nil {
+			return err
+		}
+		service.mu.Lock()
+		service.recoveryNeeded = false
+		service.mu.Unlock()
 		return nil
 	}
 	err := client.Revert(operationContext)
@@ -232,13 +274,27 @@ func (service *desktopTuneService) Close(ctx context.Context) error {
 	}
 	service.mu.Lock()
 	client := service.client
-	service.client = nil
-	service.transaction = ""
+	needsRecovery := service.recoveryNeeded
 	service.mu.Unlock()
 	if client == nil {
+		if needsRecovery {
+			service.mu.Lock()
+			service.closed = false
+			service.mu.Unlock()
+			return &tuning.RollbackError{Cause: errors.New("helper recovery has not been verified")}
+		}
 		return nil
 	}
-	return client.Close(ctx)
+	err := client.Close(ctx)
+	service.mu.Lock()
+	if err != nil {
+		service.closed = false
+	} else {
+		service.client = nil
+		service.transaction = ""
+	}
+	service.mu.Unlock()
+	return err
 }
 
 func closeTuneSession(client tuneSession) {
@@ -248,11 +304,74 @@ func closeTuneSession(client tuneSession) {
 }
 
 func (service *desktopTuneService) publish(event tuning.Event) <-chan tuning.Event {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.publishLocked(event)
+}
+
+func (service *desktopTuneService) publishLocked(event tuning.Event) <-chan tuning.Event {
 	if service.eventStore != nil {
 		service.eventStore.Append(event)
+	}
+	if service.eventStream != nil {
+		select {
+		case service.eventStream <- event:
+		default:
+			select {
+			case <-service.eventStream:
+			default:
+			}
+			select {
+			case service.eventStream <- event:
+			default:
+			}
+		}
 	}
 	stream := make(chan tuning.Event, 1)
 	stream <- event
 	close(stream)
 	return stream
+}
+
+func (service *desktopTuneService) Events() <-chan tuning.Event {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.eventStream == nil {
+		service.eventStream = make(chan tuning.Event, 32)
+	}
+	return service.eventStream
+}
+
+func (service *desktopTuneService) watchSession(client tuneSession) {
+	source, ok := client.(interface{ Events() <-chan tuning.Event })
+	if !ok {
+		return
+	}
+	go func() {
+		for event := range source.Events() {
+			service.mu.Lock()
+			if service.client != client {
+				service.mu.Unlock()
+				continue
+			}
+			if event.Kind == "session_terminated" || event.Kind == "session_closed" {
+				service.client = nil
+				service.privileged = tuning.CapabilitySet{}
+				service.transaction = ""
+				service.recoveryNeeded = event.Kind == "session_terminated"
+			}
+			if event.Kind == "rollback_complete" {
+				service.transaction = ""
+				service.recoveryNeeded = false
+			}
+			if event.Kind == "rollback_incomplete" {
+				service.recoveryNeeded = true
+			}
+			service.publishLocked(event)
+			service.mu.Unlock()
+			if event.Kind == "session_terminated" || event.Kind == "session_closed" {
+				closeTuneSession(client)
+			}
+		}
+	}()
 }

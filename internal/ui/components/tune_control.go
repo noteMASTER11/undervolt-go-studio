@@ -98,9 +98,9 @@ func capabilityStatus(capability tuning.Capability) string {
 	switch capability.State {
 	case tuning.StateSupported:
 		if capability.Experimental {
-			return "Available · experimental · restored automatically when the session ends"
+			return "Available · experimental · session end triggers rollback"
 		}
-		return "Available · restored automatically when the session ends"
+		return "Available · temporary · session end triggers rollback"
 	case tuning.StateReadOnly:
 		return "Read-only on this system"
 	case tuning.StateFirmwareLocked:

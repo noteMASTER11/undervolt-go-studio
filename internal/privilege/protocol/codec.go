@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -92,12 +93,28 @@ func (writer *Writer) Write(message Message) error {
 	return err
 }
 
+// WriteContext bounds response delivery. Closing a timed-out pipe releases its
+// writer goroutine; callers must not reuse the stream after a timeout.
+func (writer *Writer) WriteContext(ctx context.Context, message Message) error {
+	done := make(chan error, 1)
+	go func() { done <- writer.Write(message) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if closer, ok := writer.writer.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		return ctx.Err()
+	}
+}
+
 func validateMessage(message Message, direction Direction) error {
 	if message.Version != Version {
 		return fmt.Errorf("%w: unsupported version %d", ErrInvalidMessage, message.Version)
 	}
-	if message.RequestID == "" {
-		return fmt.Errorf("%w: empty request ID", ErrInvalidMessage)
+	if message.RequestID == "" || len(message.RequestID) > MaxMetadataSize {
+		return fmt.Errorf("%w: request ID length is invalid", ErrInvalidMessage)
 	}
 	if !knownType(message.Type) {
 		return fmt.Errorf("%w: unknown type %q", ErrInvalidMessage, message.Type)
@@ -124,6 +141,8 @@ func validatePayload(messageType Type, payload json.RawMessage) error {
 	switch messageType {
 	case TypeHello:
 		destination = &HelloPayload{}
+	case TypeReady:
+		destination = &HelperPayload{}
 	case TypeProbe, TypeClose:
 		destination = &ProbePayload{}
 	case TypeBegin:
@@ -141,7 +160,41 @@ func validatePayload(messageType Type, payload json.RawMessage) error {
 	default:
 		return fmt.Errorf("unknown type %q", messageType)
 	}
-	return decodeStrict(payload, destination)
+	if err := decodeStrict(payload, destination); err != nil {
+		return err
+	}
+	tooLong := func(values ...string) bool {
+		for _, value := range values {
+			if len(value) > MaxMetadataSize {
+				return true
+			}
+		}
+		return false
+	}
+	switch value := destination.(type) {
+	case *HelloPayload:
+		if tooLong(value.Client, value.Build) {
+			return errors.New("hello metadata too long")
+		}
+	case *HelperPayload:
+		if tooLong(value.Build) {
+			return errors.New("helper identity too long")
+		}
+	case *TransactionPayload:
+		if tooLong(value.TransactionID) {
+			return errors.New("transaction identity too long")
+		}
+	case *BeginPayload:
+		if tooLong(value.Changes.Generation, value.Changes.MachineID) || len(value.Changes.Changes) > 9 {
+			return errors.New("change metadata too long")
+		}
+		for _, change := range value.Changes.Changes {
+			if tooLong(string(change.ID), change.Requested.Choice) || len(change.Requested.Vector) > 8 {
+				return errors.New("control metadata too long")
+			}
+		}
+	}
+	return nil
 }
 
 func decodeStrict(data []byte, destination any) error {

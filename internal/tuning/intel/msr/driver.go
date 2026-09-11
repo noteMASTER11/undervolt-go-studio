@@ -86,7 +86,7 @@ func (driver *Driver) probePCoreRatios() tuning.Capability {
 	if err != nil {
 		capability.State = tuning.StateKernelBlocked
 		capability.ReasonCode = ReasonCode(err)
-		capability.Reason = err.Error()
+		capability.Reason = "The kernel does not permit reading the reviewed ratio register"
 		return capability
 	}
 	ratios := DecodeTurboRatios(raw, driver.pCoreCount)
@@ -98,7 +98,9 @@ func (driver *Driver) probePCoreRatios() tuning.Capability {
 	driver.mu.Lock()
 	driver.currentRatios = append([]float64(nil), ratios...)
 	driver.mu.Unlock()
-	capability.State = tuning.StateSupported
+	capability.State = tuning.StateReadOnly
+	capability.ReasonCode = "intel.msr.ratio_writability_unverified"
+	capability.Reason = "Ratio writes and stock restoration cannot be verified without mutation; editing is disabled"
 	capability.Current = tuning.VectorValue(ratios)
 	return capability
 }
@@ -109,24 +111,16 @@ func (driver *Driver) probeVoltage(id tuning.ControlID, plane VoltagePlane, labe
 		Scope:             "CPU package",
 		Label:             label,
 		Unit:              tuning.UnitMilliVolt,
-		State:             tuning.StateSupported,
-		Range:             &tuning.NumericRange{Minimum: -250, Maximum: 0, Step: 1 / 1.024},
+		State:             tuning.StateReadOnly,
+		ReasonCode:        "intel.msr.voltage_writability_unverified",
+		Reason:            "Voltage lock state and stock restoration cannot be established safely; editing is disabled",
 		DriverID:          driver.ID(),
 		RequiresPrivilege: true,
 		Experimental:      true,
 		ObservedAt:        time.Now(),
 	}
-	current, err := readVoltage(driver.device, 0, plane)
-	if err != nil {
-		capability.State = tuning.StateKernelBlocked
-		capability.ReasonCode = ReasonCode(err)
-		if capability.ReasonCode == "" {
-			capability.ReasonCode = "intel.msr.mailbox_unavailable"
-		}
-		capability.Reason = err.Error()
-		return capability
-	}
-	capability.Current = tuning.NumericValue(current)
+	// The mailbox read command itself requires an MSR write. It cannot prove
+	// writability, so production discovery leaves the value unknown.
 	return capability
 }
 
@@ -137,38 +131,18 @@ func (driver *Driver) Prepare(ctx context.Context, change tuning.Change) (tuning
 	if !driver.modelOK {
 		return nil, fmt.Errorf("msr: processor model is not allow-listed")
 	}
-	switch change.ID {
-	case tuning.ControlRatioPCore:
-		if change.Requested.Kind != tuning.ValueVector || driver.model.PCoreRatio == nil {
-			return nil, fmt.Errorf("msr: invalid P-core ratio request")
-		}
-		driver.mu.RLock()
-		current := append([]float64(nil), driver.currentRatios...)
-		driver.mu.RUnlock()
-		if _, err := EncodeTurboRatios(current, change.Requested.Vector); err != nil {
-			return nil, err
-		}
-		return &ratioOperation{device: driver.device, cpu: 0, register: driver.model.PCoreRatio.Register, count: driver.pCoreCount, requested: append([]float64(nil), change.Requested.Vector...)}, nil
-	case tuning.ControlVoltageCore, tuning.ControlVoltageCache:
-		if change.Requested.Kind != tuning.ValueNumeric {
-			return nil, fmt.Errorf("msr: voltage request must be numeric")
-		}
-		if _, _, err := EncodeVoltageOffset(change.Requested.Number); err != nil {
-			return nil, err
-		}
-		plane := PlaneCore
-		if change.ID == tuning.ControlVoltageCache {
-			plane = PlaneCache
-		}
-		return &voltageOperation{device: driver.device, cpu: 0, plane: plane, id: change.ID, requested: change.Requested.Number, healthInterval: driver.healthInterval}, nil
-	default:
-		return nil, fmt.Errorf("msr: unsupported control %s", change.ID)
-	}
+	return nil, fmt.Errorf("msr: writability and restoration eligibility are unverified for %s", change.ID)
 }
 
 func (driver *Driver) Restore(ctx context.Context, id tuning.ControlID, raw json.RawMessage) (tuning.Value, error) {
+	if !driver.modelOK {
+		return tuning.Value{}, fmt.Errorf("msr: processor model is not allow-listed")
+	}
 	switch id {
 	case tuning.ControlRatioPCore:
+		if driver.model.PCoreRatio == nil || driver.pCoreCount != driver.model.PCoreRatio.Entries {
+			return tuning.Value{}, fmt.Errorf("msr: ratio recovery topology does not match the reviewed layout")
+		}
 		return (&ratioOperation{device: driver.device, cpu: 0, register: driver.model.PCoreRatio.Register, count: driver.pCoreCount}).Restore(ctx, raw)
 	case tuning.ControlVoltageCore, tuning.ControlVoltageCache:
 		plane := PlaneCore

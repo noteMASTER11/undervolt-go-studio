@@ -33,6 +33,10 @@ func (operation *operation) ControlID() tuning.ControlID { return operation.id }
 func (operation *operation) DriverID() string            { return "intel.powercap" }
 func (operation *operation) Order() int                  { return tuning.OrderPower }
 
+func (operation *operation) Remaining(ctx context.Context) (tuning.Value, error) {
+	return operation.effectiveValue(ctx)
+}
+
 func (operation *operation) Capture(ctx context.Context) (json.RawMessage, error) {
 	records := make([]snapshotRecord, 0, len(operation.sources))
 	for _, source := range operation.sources {

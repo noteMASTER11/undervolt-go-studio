@@ -3,6 +3,7 @@ package thermal
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
@@ -24,6 +25,28 @@ func TestTCCCapabilityUsesEffectiveCeiling(t *testing.T) {
 	}
 	if capability.Range.Minimum != 0 {
 		t.Fatalf("minimum ceiling = %v", capability.Range.Minimum)
+	}
+}
+
+func TestTCCRevisionIncludesTemperatureReferenceIdentity(t *testing.T) {
+	store := tccStore(105, 10, 127)
+	driver := New(store)
+	first, err := driver.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range store.Files {
+		if strings.HasPrefix(path, hwmonRoot+"/hwmon7/") {
+			delete(store.Files, path)
+			store.Files[strings.Replace(path, "hwmon7", "hwmon9", 1)] = value
+		}
+	}
+	second, err := driver.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].SourceRevision == second[0].SourceRevision {
+		t.Fatal("replaced temperature reference kept reviewed identity")
 	}
 }
 

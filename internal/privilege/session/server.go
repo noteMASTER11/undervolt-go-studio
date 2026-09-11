@@ -14,15 +14,14 @@ import (
 
 type Transaction interface {
 	ID() string
+	Effective() map[tuning.ControlID]tuning.Value
 	Rollback(context.Context) error
 }
-
 type Backend interface {
 	Recover(context.Context) (tuning.RecoveryResult, error)
 	Probe(context.Context) (tuning.CapabilitySet, error)
 	Apply(context.Context, tuning.ChangeSet) (Transaction, tuning.ValidationResult, error)
 }
-
 type Option func(*Server)
 
 func WithLease(duration time.Duration) Option {
@@ -42,15 +41,6 @@ func NewServer(backend Backend, options ...Option) *Server {
 	return server
 }
 
-type state uint8
-
-const (
-	stateStarting state = iota
-	stateGreeted
-	stateProbed
-	stateActive
-)
-
 type readResult struct {
 	message protocol.Message
 	err     error
@@ -58,170 +48,224 @@ type readResult struct {
 
 func (server *Server) Run(ctx context.Context, reader *protocol.Reader, writer *protocol.Writer) error {
 	messages := make(chan readResult, 1)
+	stopped := make(chan struct{})
+	defer close(stopped)
 	go func() {
 		for {
 			message, err := reader.Read()
-			messages <- readResult{message: message, err: err}
+			select {
+			case messages <- readResult{message, err}:
+			case <-stopped:
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
-
-	currentState := stateStarting
 	var active Transaction
-	var leaseTimer *time.Timer
-	var leaseChannel <-chan time.Time
+	var timer *time.Timer
+	var lease <-chan time.Time
+	greeted, probed := false, false
+	seen := make(map[string]struct{})
 	stopLease := func() {
-		if leaseTimer != nil {
-			leaseTimer.Stop()
+		if timer != nil {
+			timer.Stop()
 		}
-		leaseChannel = nil
+		lease = nil
 	}
 	defer stopLease()
-	rollback := func(rollbackContext context.Context) error {
+	rollback := func() error {
 		stopLease()
 		if active == nil {
 			return nil
 		}
-		err := active.Rollback(rollbackContext)
-		active = nil
-		currentState = stateProbed
+		// Rollback does not inherit cancellation from a dead GUI or signal.
+		err := active.Rollback(context.WithoutCancel(ctx))
+		if err == nil {
+			active = nil
+		}
 		return err
 	}
-
+	rollbackMessage := func(id string, err error) error {
+		kind := protocol.TypeRollbackComplete
+		payload := protocol.FailurePayload{Message: "Stock settings restored"}
+		if err != nil {
+			kind = protocol.TypeRollbackIncomplete
+			payload = rollbackFailure(err)
+		}
+		return server.write(writer, id, kind, payload)
+	}
+	fatal := func(err error, id string) error {
+		// Restore before trying to write any error response, even if stdout is full.
+		hadActive := active != nil
+		restoreErr := rollback()
+		if hadActive {
+			_ = rollbackMessage(id, restoreErr)
+		} else {
+			_ = server.write(writer, id, protocol.TypeFailed, protocol.FailurePayload{Message: "Tuning session failed before starting a new transaction"})
+		}
+		return errors.Join(err, restoreErr)
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.Join(ctx.Err(), rollback(context.WithoutCancel(ctx)))
-		case <-leaseChannel:
-			err := rollback(context.WithoutCancel(ctx))
-			messageType := protocol.TypeRollbackComplete
-			if err != nil {
-				messageType = protocol.TypeRollbackIncomplete
+			return errors.Join(ctx.Err(), rollback())
+		case <-lease:
+			err := rollback()
+			writeErr := rollbackMessage("lease", err)
+			if writeErr != nil || err == nil {
+				return errors.Join(err, writeErr)
 			}
-			writeErr := writePayload(writer, "lease", messageType, protocol.FailurePayload{Message: "Tuning lease expired; stock settings restored"})
-			return errors.Join(err, writeErr)
+			// Keep a failed rollback available for an explicit retry.
 		case incoming := <-messages:
 			if incoming.err != nil {
-				rollbackErr := rollback(context.WithoutCancel(ctx))
+				err := rollback()
 				if errors.Is(incoming.err, io.EOF) {
-					return rollbackErr
+					return err
 				}
-				return errors.Join(incoming.err, rollbackErr)
+				return errors.Join(incoming.err, err)
 			}
 			message := incoming.message
+			if _, duplicate := seen[message.RequestID]; duplicate {
+				return fatal(errors.New("duplicate request ID"), message.RequestID)
+			}
+			if len(seen) >= 4096 {
+				return fatal(errors.New("session request limit reached"), message.RequestID)
+			}
+			seen[message.RequestID] = struct{}{}
+			invalid := func() error {
+				return fatal(fmt.Errorf("session: invalid %s transition", message.Type), message.RequestID)
+			}
 			switch message.Type {
 			case protocol.TypeHello:
-				if currentState != stateStarting {
-					return server.invalidTransition(ctx, writer, message, &active)
+				if greeted {
+					return invalid()
 				}
-				currentState = stateGreeted
+				greeted = true
+				if err := server.write(writer, message.RequestID, protocol.TypeReady, protocol.HelperPayload{Build: protocol.HelperBuildIdentity}); err != nil {
+					return err
+				}
 			case protocol.TypeProbe:
-				if currentState != stateGreeted && currentState != stateProbed {
-					return server.invalidTransition(ctx, writer, message, &active)
+				if !greeted || active != nil {
+					return invalid()
 				}
-				if _, err := server.backend.Recover(ctx); err != nil {
-					_ = writePayload(writer, message.RequestID, protocol.TypeFailed, protocol.FailurePayload{Message: err.Error()})
+				// Hydrate source tables, restore matching recovery, then publish stock.
+				if _, err := server.backend.Probe(ctx); err != nil {
+					_ = server.write(writer, message.RequestID, protocol.TypeRollbackIncomplete, rollbackFailure(err))
 					return err
 				}
-				capabilities, err := server.backend.Probe(ctx)
+				recovery, err := server.backend.Recover(ctx)
+				if recovery.StaleBoot || len(recovery.Discrepancies) > 0 {
+					err = errors.Join(err, errors.New("recovery audit is unresolved; new tuning is blocked"))
+				}
 				if err != nil {
-					_ = writePayload(writer, message.RequestID, protocol.TypeFailed, protocol.FailurePayload{Message: err.Error()})
+					_ = server.write(writer, message.RequestID, protocol.TypeRollbackIncomplete, rollbackFailure(err))
 					return err
 				}
-				if err := writePayload(writer, message.RequestID, protocol.TypeCapabilities, protocol.CapabilitiesPayload{Capabilities: capabilities}); err != nil {
+				caps, err := server.backend.Probe(ctx)
+				if err != nil {
+					return fatal(err, message.RequestID)
+				}
+				if err := server.write(writer, message.RequestID, protocol.TypeCapabilities, protocol.CapabilitiesPayload{Capabilities: caps}); err != nil {
 					return err
 				}
-				currentState = stateProbed
+				probed = true
 			case protocol.TypeBegin:
-				if currentState != stateProbed || active != nil {
-					return server.invalidTransition(ctx, writer, message, &active)
+				if !probed || active != nil {
+					return invalid()
 				}
 				var payload protocol.BeginPayload
-				if err := json.Unmarshal(message.Payload, &payload); err != nil {
-					return err
+				json.Unmarshal(message.Payload, &payload)
+				caps, err := server.backend.Probe(ctx)
+				if err != nil {
+					return fatal(err, message.RequestID)
+				}
+				if caps.Generation != payload.Changes.Generation || caps.MachineID != payload.Changes.MachineID {
+					if err := server.write(writer, message.RequestID, protocol.TypeReviewChanged, protocol.CapabilitiesPayload{Capabilities: caps}); err != nil {
+						return err
+					}
+					continue
 				}
 				transaction, _, err := server.backend.Apply(ctx, payload.Changes)
-				if err != nil {
-					if errors.Is(err, tuning.ErrStaleCapabilities) {
-						capabilities, probeErr := server.backend.Probe(ctx)
-						if probeErr != nil {
-							return errors.Join(err, probeErr)
-						}
-						return writePayload(writer, message.RequestID, protocol.TypeReviewChanged, protocol.CapabilitiesPayload{Capabilities: capabilities})
-					}
-					return writePayload(writer, message.RequestID, protocol.TypeFailed, protocol.FailurePayload{Message: err.Error()})
-				}
 				active = transaction
-				currentState = stateActive
-				leaseTimer = time.NewTimer(server.lease)
-				leaseChannel = leaseTimer.C
-				if err := writePayload(writer, message.RequestID, protocol.TypeApplied, protocol.AppliedPayload{TransactionID: active.ID()}); err != nil {
-					return errors.Join(err, rollback(context.WithoutCancel(ctx)))
+				if err != nil {
+					if active != nil {
+						if writeErr := rollbackMessage(message.RequestID, err); writeErr != nil {
+							return errors.Join(err, writeErr)
+						}
+						continue
+					}
+					if errors.Is(err, tuning.ErrStaleCapabilities) {
+						if err := server.write(writer, message.RequestID, protocol.TypeReviewChanged, protocol.CapabilitiesPayload{Capabilities: caps}); err != nil {
+							return err
+						}
+						continue
+					}
+					if writeErr := server.write(writer, message.RequestID, protocol.TypeFailed, protocol.FailurePayload{Message: "Apply failed; stock restoration completed"}); writeErr != nil {
+						return errors.Join(err, writeErr)
+					}
+					continue
+				}
+				if active == nil {
+					return fatal(errors.New("backend returned no transaction"), message.RequestID)
+				}
+				timer = time.NewTimer(server.lease)
+				lease = timer.C
+				if err := server.write(writer, message.RequestID, protocol.TypeApplied, protocol.AppliedPayload{TransactionID: active.ID(), Effective: active.Effective()}); err != nil {
+					return errors.Join(err, rollback())
 				}
 			case protocol.TypeRenew:
-				if currentState != stateActive || active == nil {
-					return server.invalidTransition(ctx, writer, message, &active)
-				}
 				var payload protocol.TransactionPayload
-				if err := json.Unmarshal(message.Payload, &payload); err != nil || payload.TransactionID != active.ID() {
-					return server.invalidTransition(ctx, writer, message, &active)
+				json.Unmarshal(message.Payload, &payload)
+				if active == nil || lease == nil || payload.TransactionID != active.ID() {
+					return invalid()
 				}
-				if !leaseTimer.Stop() {
+				if !timer.Stop() {
 					select {
-					case <-leaseTimer.C:
+					case <-timer.C:
 					default:
 					}
 				}
-				leaseTimer.Reset(server.lease)
-				leaseChannel = leaseTimer.C
-			case protocol.TypeRevert:
-				if currentState != stateActive || active == nil {
-					return server.invalidTransition(ctx, writer, message, &active)
+				timer.Reset(server.lease)
+				lease = timer.C
+			case protocol.TypeRevert, protocol.TypeClose:
+				if !greeted {
+					return invalid()
 				}
-				err := rollback(context.WithoutCancel(ctx))
-				messageType := protocol.TypeRollbackComplete
-				if err != nil {
-					messageType = protocol.TypeRollbackIncomplete
+				if message.Type == protocol.TypeRevert && active == nil {
+					return invalid()
 				}
-				if writeErr := writePayload(writer, message.RequestID, messageType, protocol.FailurePayload{Message: "Stock settings restored"}); writeErr != nil {
+				err := rollback()
+				if writeErr := rollbackMessage(message.RequestID, err); writeErr != nil {
 					return errors.Join(err, writeErr)
 				}
-				if err != nil {
-					return err
-				}
-			case protocol.TypeClose:
-				if active == nil {
+				if message.Type == protocol.TypeClose && err == nil {
 					return nil
 				}
-				err := rollback(context.WithoutCancel(ctx))
-				messageType := protocol.TypeRollbackComplete
-				if err != nil {
-					messageType = protocol.TypeRollbackIncomplete
-				}
-				writeErr := writePayload(writer, message.RequestID, messageType, protocol.FailurePayload{Message: "Session closed; stock settings restored"})
-				return errors.Join(err, writeErr)
 			default:
-				return server.invalidTransition(ctx, writer, message, &active)
+				return invalid()
 			}
 		}
 	}
 }
 
-func (server *Server) invalidTransition(ctx context.Context, writer *protocol.Writer, message protocol.Message, active *Transaction) error {
-	err := fmt.Errorf("session: invalid %s transition", message.Type)
-	_ = writePayload(writer, message.RequestID, protocol.TypeFailed, protocol.FailurePayload{Message: err.Error()})
-	if *active != nil {
-		return errors.Join(err, (*active).Rollback(context.WithoutCancel(ctx)))
+func rollbackFailure(err error) protocol.FailurePayload {
+	payload := protocol.FailurePayload{Message: "Stock restoration is incomplete; retry rollback or reboot to reset temporary settings"}
+	var outcome *tuning.RollbackError
+	if errors.As(err, &outcome) {
+		payload.Remaining = outcome.Remaining
+		payload.Unverified = outcome.Unverified
 	}
-	return err
+	return payload
 }
 
-func writePayload(writer *protocol.Writer, requestID string, messageType protocol.Type, payload any) error {
+func (server *Server) write(writer *protocol.Writer, id string, kind protocol.Type, payload any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return writer.Write(protocol.Message{Version: protocol.Version, RequestID: requestID, Type: messageType, Payload: raw})
+	ctx, cancel := context.WithTimeout(context.Background(), min(250*time.Millisecond, server.lease))
+	defer cancel()
+	return writer.WriteContext(ctx, protocol.Message{Version: protocol.Version, RequestID: id, Type: kind, Payload: raw})
 }

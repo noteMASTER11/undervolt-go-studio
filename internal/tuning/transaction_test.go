@@ -59,7 +59,7 @@ func TestEngineRollsBackAppliedOperationsWhenLaterApplyFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("transaction unexpectedly succeeded")
 	}
-	want := []string{"apply:intel.package.pl1", "apply:intel.package.thermal_limit", "restore:intel.package.pl1"}
+	want := []string{"apply:intel.package.pl1", "apply:intel.package.thermal_limit", "restore:intel.package.thermal_limit", "restore:intel.package.pl1"}
 	if !reflect.DeepEqual(log, want) {
 		t.Fatalf("log = %v", log)
 	}
@@ -113,10 +113,12 @@ func (store *memoryRecoveryStore) Remove() error {
 }
 
 type transactionTestDriver struct {
-	id       string
-	order    int
-	log      *[]string
-	applyErr error
+	id         string
+	order      int
+	log        *[]string
+	applyErr   error
+	onApply    func()
+	restoreErr error
 }
 
 func (driver *transactionTestDriver) ID() string { return driver.id }
@@ -144,11 +146,65 @@ func (operation *transactionTestOperation) Capture(context.Context) (json.RawMes
 }
 func (operation *transactionTestOperation) Apply(context.Context) (Value, error) {
 	*operation.driver.log = append(*operation.driver.log, "apply:"+string(operation.change.ID))
+	if operation.driver.onApply != nil {
+		operation.driver.onApply()
+	}
 	return operation.change.Requested, operation.driver.applyErr
 }
 func (operation *transactionTestOperation) Restore(_ context.Context, _ json.RawMessage) (Value, error) {
 	*operation.driver.log = append(*operation.driver.log, "restore:"+string(operation.change.ID))
-	return NumericValue(0), nil
+	return NumericValue(0), operation.driver.restoreErr
+}
+
+func TestRecoveryArmedBeforeWriteAndRetainedAfterFailedVerification(t *testing.T) {
+	var log []string
+	drivers, caps := orderedTestDrivers(&log, map[ControlID]int{ControlPL1: OrderPower})
+	store := &memoryRecoveryStore{}
+	driver := drivers[0].(*transactionTestDriver)
+	driver.onApply = func() {
+		if !store.present || !store.record.Entries[0].Applied {
+			t.Error("possibly modified state was not durable before write")
+		}
+	}
+	driver.applyErr = errors.New("write succeeded, verification failed")
+	driver.restoreErr = errors.New("restore failed")
+	_, _, err := NewEngine(caps, store, drivers...).Apply(context.Background(), changesFor(caps))
+	if err == nil || !store.present || !store.record.Entries[0].Applied {
+		t.Fatalf("lost recovery after unverified write: error=%v present=%v record=%+v", err, store.present, store.record)
+	}
+}
+
+func TestTransactionRetainsVerifiedEffectiveValues(t *testing.T) {
+	var log []string
+	drivers, caps := orderedTestDrivers(&log, map[ControlID]int{ControlPL1: OrderPower})
+	active, _, err := NewEngine(caps, &memoryRecoveryStore{}, drivers...).Apply(context.Background(), changesFor(caps))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := active.Effective()[ControlPL1]; got.Kind != ValueNumeric || got.Number != 30 {
+		t.Fatalf("verified result lost: %+v", got)
+	}
+	active.Rollback(context.Background())
+}
+
+func TestFailedApplyReturnsRetryableIncompleteRollback(t *testing.T) {
+	var log []string
+	drivers, caps := orderedTestDrivers(&log, map[ControlID]int{ControlPL1: OrderPower})
+	driver := drivers[0].(*transactionTestDriver)
+	driver.applyErr = errors.New("verify")
+	driver.restoreErr = errors.New("restore")
+	active, _, err := NewEngine(caps, &memoryRecoveryStore{}, drivers...).Apply(context.Background(), changesFor(caps))
+	var incomplete *RollbackError
+	if active == nil || !errors.As(err, &incomplete) {
+		t.Fatalf("lost retryable rollback: active=%v err=%v", active, err)
+	}
+	if len(incomplete.Unverified) != 1 || incomplete.Unverified[0] != ControlPL1 {
+		t.Fatalf("unknown remaining value not identified: %+v", incomplete)
+	}
+	driver.restoreErr = nil
+	if err := active.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func orderedTestDrivers(log *[]string, orders map[ControlID]int) ([]Driver, CapabilitySet) {

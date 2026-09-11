@@ -270,3 +270,35 @@ func waitForTunePhase(t *testing.T, viewModel *Tune, phase string) {
 	}
 	t.Fatalf("phase = %q, want %q", viewModel.State().Phase, phase)
 }
+
+func TestTunePersistsRollbackDetailsAcrossNavigationAndReset(t *testing.T) {
+	vm := NewTune(&controlledTuneService{})
+	stream := make(chan tuning.Event, 3)
+	stream <- tuning.Event{Kind: "transaction_applied", Effective: map[tuning.ControlID]tuning.Value{tuning.ControlPL1: tuning.NumericValue(39.5)}}
+	stream <- tuning.Event{Kind: "rollback_incomplete", Message: "Stock restoration incomplete", Remaining: map[tuning.ControlID]tuning.Value{tuning.ControlPL1: tuning.NumericValue(39.5)}}
+	stream <- tuning.Event{Kind: "session_terminated", Message: "Helper lost"}
+	close(stream)
+	vm.consumeEvents(stream)
+	vm.Reset()
+	vm.Activate()
+	vm.Deactivate()
+	state := vm.State()
+	if state.Phase != PhaseRollbackIncomplete || state.Remaining[tuning.ControlPL1].Number != 39.5 || state.LastError == "" {
+		t.Fatalf("critical outcome lost: %+v", state)
+	}
+	if err := vm.Stage(tuning.ControlPL1, tuning.NumericValue(40)); err == nil {
+		t.Fatal("staging allowed before recovery")
+	}
+}
+
+func TestTuneLeaseRollbackClearsActiveSession(t *testing.T) {
+	vm := NewTune(&controlledTuneService{})
+	stream := make(chan tuning.Event, 2)
+	stream <- tuning.Event{Kind: "transaction_applied"}
+	stream <- tuning.Event{Kind: "rollback_complete"}
+	close(stream)
+	vm.consumeEvents(stream)
+	if state := vm.State(); state.SessionActive || state.Phase != PhaseIdle {
+		t.Fatalf("lease rollback left UI active: %+v", state)
+	}
+}

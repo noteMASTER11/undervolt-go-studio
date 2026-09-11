@@ -3,6 +3,7 @@ package pages
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,12 +39,17 @@ type Tune struct {
 	controls  map[tuning.ControlID]*components.TuneControl
 
 	status             *widget.Label
+	results            *widget.Label
+	recovery           *fyne.Container
+	retry              *widget.Button
+	reboot             *widget.Button
 	emptyMessage       *widget.Label
 	power              *fyne.Container
 	thermal            *fyne.Container
 	ratios             *fyne.Container
 	workbench          *fyne.Container
 	pending            *components.PendingRail
+	railContent        *fyne.Container
 	controlsGeneration string
 	controlsBuilt      bool
 	controlsLocked     bool
@@ -65,7 +71,7 @@ func NewTuneWithDispatcher(viewModel *viewmodel.Tune, source viewmodel.Subscript
 		liveCards: map[string]*components.MetricCard{
 			"temperature": components.NewMetricCard("Package temperature", "°C"),
 			"power":       components.NewMetricCard("Package power", "W"),
-			"frequency":   components.NewMetricCard("P-core maximum", "MHz"),
+			"frequency":   components.NewMetricCard("CPU maximum", "MHz"),
 		},
 		status:       widget.NewLabel("Open Tune to discover available controls"),
 		emptyMessage: widget.NewLabel("Discovering available controls…"),
@@ -80,6 +86,13 @@ func NewTuneWithDispatcher(viewModel *viewmodel.Tune, source viewmodel.Subscript
 	page.pending = components.NewPendingRail(page.viewModel.Reset, page.showReview, func() {
 		go func() { _ = page.viewModel.Revert(context.Background()) }()
 	})
+	page.results = widget.NewLabel("")
+	page.results.Wrapping = fyne.TextWrapWord
+	page.retry = widget.NewButton("Retry rollback / recovery", func() { go func() { _ = page.viewModel.Revert(context.Background()) }() })
+	page.reboot = widget.NewButton("Reboot to reset", page.showRebootGuidance)
+	rebootGuide := widget.NewLabel("Save your work, then restart Linux. A hard lock requires a power cycle.")
+	rebootGuide.Wrapping = fyne.TextWrapWord
+	page.recovery = container.NewVBox(page.retry, page.reboot, rebootGuide)
 	page.dispatcher = components.NewLatestDispatcher(dispatch, page.render)
 
 	header := container.NewVBox(
@@ -100,7 +113,8 @@ func NewTuneWithDispatcher(viewModel *viewmodel.Tune, source viewmodel.Subscript
 		sectionCard("Thermal & voltage", "Thermal ceiling and conservative voltage offsets", page.thermal),
 		sectionCard("Core ratios", "Per-active-core turbo ratio limits", page.ratios),
 	)
-	right := container.NewGridWrap(fyne.NewSize(350, 650), page.pending.Object())
+	page.railContent = container.NewVBox(page.pending.Object(), page.results, page.recovery)
+	right := container.NewGridWrap(fyne.NewSize(350, 650), page.railContent)
 	page.root = container.NewPadded(container.NewBorder(header, nil, nil, right, container.NewVScroll(page.workbench)))
 	page.render(viewModel.State())
 	page.SetCatalog(catalog)
@@ -143,6 +157,19 @@ func (page *Tune) SetCatalog(catalog telemetry.Catalog) {
 
 func (page *Tune) render(state viewmodel.TuneState) {
 	page.status.SetText(phaseLabel(state.Phase, state.LastError))
+	page.results.SetText(outcomeText(state))
+	if page.results.Text == "" {
+		page.results.Hide()
+	} else {
+		page.results.Show()
+	}
+	if state.Phase == viewmodel.PhaseRollbackIncomplete {
+		page.status.SetText("Rollback incomplete · attention required")
+		page.recovery.Show()
+		page.retry.Enable()
+	} else {
+		page.recovery.Hide()
+	}
 	locked := state.SessionActive || state.Phase == viewmodel.PhaseAuthorizing || state.Phase == viewmodel.PhaseApplying || state.Phase == viewmodel.PhaseRollingBack
 	rebuild := !page.controlsBuilt || page.controlsGeneration != state.Capabilities.Generation || page.controlsLocked != locked || (page.hadPending && len(state.Pending) == 0)
 	if rebuild {
@@ -152,6 +179,61 @@ func (page *Tune) render(state viewmodel.TuneState) {
 	page.pending.SetChanges(state.Pending, state.Capabilities)
 	page.pending.SetReviewEnabled(canReview(state))
 	page.pending.SetSessionActive(state.SessionActive)
+	if page.railContent != nil {
+		page.railContent.Refresh()
+	}
+	if page.root != nil {
+		page.root.Refresh()
+	}
+}
+
+func outcomeText(state viewmodel.TuneState) string {
+	labels := make(map[tuning.ControlID]string)
+	units := make(map[tuning.ControlID]tuning.Unit)
+	requested := make(map[tuning.ControlID]tuning.Value)
+	for _, cap := range state.Capabilities.Capabilities {
+		labels[cap.ID] = cap.Label
+		units[cap.ID] = cap.Unit
+	}
+	for _, change := range state.Pending {
+		requested[change.ID] = change.Requested
+	}
+	values := state.Effective
+	if state.Phase == viewmodel.PhaseRollbackIncomplete {
+		values = state.Remaining
+	}
+	ids := make([]tuning.ControlID, 0, len(values))
+	for id := range values {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	var rows []string
+	if state.Phase == viewmodel.PhaseRollbackIncomplete {
+		message := state.LastError
+		if message == "" {
+			message = "Stock restoration is incomplete."
+		}
+		rows = append(rows, message)
+	}
+	for _, id := range ids {
+		label := labels[id]
+		if label == "" {
+			label = string(id)
+		}
+		if state.Phase == viewmodel.PhaseRollbackIncomplete {
+			rows = append(rows, fmt.Sprintf("%s · Verified remaining %s %s", label, valueText(values[id]), units[id]))
+		} else {
+			rows = append(rows, fmt.Sprintf("%s\nRequested %s %s · Verified %s %s", label, valueText(requested[id]), units[id], valueText(values[id]), units[id]))
+		}
+	}
+	for _, id := range state.Unverified {
+		label := labels[id]
+		if label == "" {
+			label = string(id)
+		}
+		rows = append(rows, label+" · remaining value could not be verified")
+	}
+	return strings.Join(rows, "\n\n")
 }
 
 func canReview(state viewmodel.TuneState) bool {
@@ -219,7 +301,7 @@ func (page *Tune) showReview() {
 		return
 	}
 	content := container.NewVBox(
-		widget.NewLabel("These settings are temporary. Closing the app, losing the helper, or lease expiry restores stock values."),
+		widget.NewLabel("These settings are temporary. Closing the app, losing the helper, or lease expiry triggers rollback. If restoration fails, save your work and reboot to reset."),
 		widget.NewSeparator(),
 	)
 	for _, row := range rows {
@@ -236,6 +318,14 @@ func (page *Tune) showReview() {
 			page.viewModel.CancelReview()
 		}
 	}, application.Driver().AllWindows()[0]).Show()
+}
+
+func (page *Tune) showRebootGuidance() {
+	application := fyne.CurrentApp()
+	if application == nil || application.Driver() == nil || len(application.Driver().AllWindows()) == 0 {
+		return
+	}
+	dialog.ShowInformation("Reboot to reset", "Save your work, then restart Linux using the system menu. If the computer has hard-locked, a power cycle is required. This app does not initiate a reboot.", application.Driver().AllWindows()[0])
 }
 
 func formatReviewRow(row viewmodel.ReviewRow) string {

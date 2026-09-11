@@ -39,6 +39,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	var policies []string
 	var common []string
 	var current []string
+	var revisionPaths []string
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -47,6 +48,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 			continue
 		}
 		base := eppRoot + "/" + entry
+		revisionPaths = append(revisionPaths, base+"/energy_performance_available_preferences", base+"/energy_performance_preference", base+"/scaling_governor", base+"/scaling_driver")
 		availableRaw, availableErr := driver.store.Read(base + "/energy_performance_available_preferences")
 		currentRaw, currentErr := driver.store.Read(base + "/energy_performance_preference")
 		if availableErr != nil || currentErr != nil {
@@ -88,6 +90,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		}
 	}
 	return []tuning.Capability{{
+		SourceRevision:    sysfs.Revision(driver.store, revisionPaths...),
 		ID:                tuning.ControlEPP,
 		Scope:             "All CPU policies",
 		Label:             "Energy preference",
@@ -148,6 +151,13 @@ type operation struct {
 func (operation *operation) ControlID() tuning.ControlID { return tuning.ControlEPP }
 func (operation *operation) DriverID() string            { return "intel.epp" }
 func (operation *operation) Order() int                  { return tuning.OrderPolicy }
+
+func (operation *operation) Remaining(ctx context.Context) (tuning.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return tuning.Value{}, err
+	}
+	return effectivePreference(operation.store, operation.paths)
+}
 
 func (operation *operation) Capture(ctx context.Context) (json.RawMessage, error) {
 	records := make([]preferenceRecord, 0, len(operation.paths))

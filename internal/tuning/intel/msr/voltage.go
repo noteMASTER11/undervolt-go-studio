@@ -112,6 +112,17 @@ func (operation *voltageOperation) ControlID() tuning.ControlID { return operati
 func (operation *voltageOperation) DriverID() string            { return "intel.msr" }
 func (operation *voltageOperation) Order() int                  { return tuning.OrderVoltage }
 
+func (operation *voltageOperation) Remaining(ctx context.Context) (tuning.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return tuning.Value{}, err
+	}
+	value, err := readVoltage(operation.device, operation.cpu, operation.plane)
+	if err != nil {
+		return tuning.Value{}, err
+	}
+	return tuning.NumericValue(value), nil
+}
+
 func (operation *voltageOperation) Capture(ctx context.Context) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -119,6 +130,9 @@ func (operation *voltageOperation) Capture(ctx context.Context) (json.RawMessage
 	current, err := readVoltage(operation.device, operation.cpu, operation.plane)
 	if err != nil {
 		return nil, err
+	}
+	if _, normalized, err := EncodeVoltageOffset(current); err != nil || normalized != current {
+		return nil, fmt.Errorf("msr: captured voltage is outside the restorable range")
 	}
 	operation.captured = &current
 	return json.Marshal(current)
@@ -138,30 +152,41 @@ func (operation *voltageOperation) Apply(ctx context.Context) (tuning.Value, err
 }
 
 func (operation *voltageOperation) Restore(ctx context.Context, raw json.RawMessage) (tuning.Value, error) {
-	var captured float64
+	var captured *float64
 	if err := json.Unmarshal(raw, &captured); err != nil {
 		return tuning.Value{}, err
 	}
-	effective, err := operation.stepTo(ctx, captured)
+	if captured == nil {
+		return tuning.Value{}, fmt.Errorf("msr: missing voltage recovery snapshot")
+	}
+	if _, normalized, err := EncodeVoltageOffset(*captured); err != nil || normalized != *captured {
+		return tuning.Value{}, fmt.Errorf("msr: voltage recovery snapshot is outside the exact restorable range")
+	}
+	effective, err := operation.stepTo(ctx, *captured)
 	return tuning.NumericValue(effective), err
 }
 
 func (operation *voltageOperation) stepTo(ctx context.Context, target float64) (float64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	_, normalized, err := EncodeVoltageOffset(target)
+	if err != nil {
+		return 0, err
+	}
 	current, err := readVoltage(operation.device, operation.cpu, operation.plane)
 	if err != nil {
 		return 0, err
 	}
-	delta := target - current
-	steps := int(math.Ceil(math.Abs(delta) / 10))
-	if steps == 0 {
-		return current, nil
-	}
+	currentUnits := int(math.Round(current * 1.024))
+	targetUnits := int(math.Round(normalized * 1.024))
 	effective := current
-	for step := 1; step <= steps; step++ {
+	for currentUnits != targetUnits {
 		if err := ctx.Err(); err != nil {
 			return effective, err
 		}
-		next := current + delta*float64(step)/float64(steps)
+		currentUnits += max(-10, min(10, targetUnits-currentUnits))
+		next := float64(currentUnits) / 1.024
 		effective, err = writeVoltage(operation.device, operation.cpu, operation.plane, next)
 		if err != nil {
 			return effective, err

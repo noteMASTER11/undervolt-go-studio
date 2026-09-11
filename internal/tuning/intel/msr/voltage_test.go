@@ -1,9 +1,30 @@
 package msr
 
 import (
+	"context"
 	"math"
 	"testing"
 )
+
+func TestVoltageTransitionsNeverExceedTenMailboxUnits(t *testing.T) {
+	for _, target := range []float64{-20, -30, -50, -125, -250} {
+		device := newSemanticMSRDevice(0)
+		op := &voltageOperation{device: device, plane: PlaneCore, requested: target}
+		if _, err := op.Capture(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := op.Apply(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		last := 0.0
+		for _, value := range device.voltageSequence {
+			if math.Abs(value-last) > 9.765625 {
+				t.Fatalf("target %v: transition %.9f -> %.9f exceeds ten mailbox units", target, last, value)
+			}
+			last = value
+		}
+	}
+}
 
 func TestVoltageOffsetRoundTrip(t *testing.T) {
 	for _, millivolts := range []float64{0, -10, -50, -125} {

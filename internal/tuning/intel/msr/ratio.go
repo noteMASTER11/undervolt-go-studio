@@ -60,6 +60,17 @@ func (operation *ratioOperation) ControlID() tuning.ControlID { return tuning.Co
 func (operation *ratioOperation) DriverID() string            { return "intel.msr" }
 func (operation *ratioOperation) Order() int                  { return tuning.OrderRatio }
 
+func (operation *ratioOperation) Remaining(ctx context.Context) (tuning.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return tuning.Value{}, err
+	}
+	raw, err := operation.device.Read(operation.cpu, operation.register)
+	if err != nil {
+		return tuning.Value{}, err
+	}
+	return tuning.VectorValue(DecodeTurboRatios(raw, operation.count)), nil
+}
+
 func (operation *ratioOperation) Capture(ctx context.Context) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -104,6 +115,9 @@ func (operation *ratioOperation) Restore(ctx context.Context, raw json.RawMessag
 	var captured uint64
 	if err := json.Unmarshal(raw, &captured); err != nil {
 		return tuning.Value{}, err
+	}
+	if err := validateDiscoveredRatios(DecodeTurboRatios(captured, operation.count)); err != nil {
+		return tuning.Value{}, fmt.Errorf("msr: invalid ratio recovery snapshot: %w", err)
 	}
 	if err := operation.device.Write(operation.cpu, operation.register, captured); err != nil {
 		return tuning.Value{}, err

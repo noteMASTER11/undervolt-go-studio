@@ -44,7 +44,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	if err != nil {
 		return nil, err
 	}
-	tjMax, err := driver.findTjMax(ctx)
+	tjMax, reference, err := driver.findTjMax(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -64,6 +64,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	}
 	minimum := math.Max(0, float64(tjMax-maxOffset))
 	return []tuning.Capability{{
+		SourceRevision:    sysfs.Revision(driver.store, coolingState, pciAttribute, reference),
 		ID:                tuning.ControlThermalLimit,
 		Scope:             "CPU package",
 		Label:             "Thermal limit",
@@ -157,14 +158,14 @@ func (driver *Driver) findPCIAttribute(ctx context.Context) (string, int64, erro
 	return "", 0, fmt.Errorf("tcc: PCI TCC offset attribute not found")
 }
 
-func (driver *Driver) findTjMax(ctx context.Context) (int64, error) {
+func (driver *Driver) findTjMax(ctx context.Context) (int64, string, error) {
 	entries, err := driver.store.List(hwmonRoot)
 	if err != nil {
-		return 0, fmt.Errorf("tcc: enumerate hwmon: %w", err)
+		return 0, "", fmt.Errorf("tcc: enumerate hwmon: %w", err)
 	}
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		base := hwmonRoot + "/" + entry
 		name, readErr := readTrimmed(driver.store, base+"/name")
@@ -173,9 +174,10 @@ func (driver *Driver) findTjMax(ctx context.Context) (int64, error) {
 		}
 		files, listErr := driver.store.List(base)
 		if listErr != nil {
-			return 0, listErr
+			return 0, "", listErr
 		}
 		var tjMax int64
+		var reference string
 		for _, file := range files {
 			if !strings.HasPrefix(file, "temp") || !strings.HasSuffix(file, "_crit") {
 				continue
@@ -183,13 +185,14 @@ func (driver *Driver) findTjMax(ctx context.Context) (int64, error) {
 			critical, criticalErr := readInteger(driver.store, base+"/"+file)
 			if criticalErr == nil && critical > tjMax {
 				tjMax = critical
+				reference = base + "/" + file
 			}
 		}
 		if tjMax > 0 {
-			return tjMax / 1000, nil
+			return tjMax / 1000, reference, nil
 		}
 	}
-	return 0, fmt.Errorf("tcc: coretemp critical temperature not found")
+	return 0, "", fmt.Errorf("tcc: coretemp critical temperature not found")
 }
 
 type tccSnapshot struct {
@@ -208,6 +211,24 @@ type tccOperation struct {
 func (operation *tccOperation) ControlID() tuning.ControlID { return tuning.ControlThermalLimit }
 func (operation *tccOperation) DriverID() string            { return "intel.tcc" }
 func (operation *tccOperation) Order() int                  { return tuning.OrderThermal }
+
+func (operation *tccOperation) Remaining(ctx context.Context) (tuning.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return tuning.Value{}, err
+	}
+	pci, err := readInteger(operation.store, operation.pciPath)
+	if err != nil {
+		return tuning.Value{}, err
+	}
+	cooling, err := readInteger(operation.store, operation.coolingPath)
+	if err != nil {
+		return tuning.Value{}, err
+	}
+	if pci != cooling {
+		return tuning.Value{}, fmt.Errorf("tcc: remaining interfaces disagree")
+	}
+	return tuning.NumericValue(float64(operation.tjMax - pci)), nil
+}
 
 func (operation *tccOperation) Capture(ctx context.Context) (json.RawMessage, error) {
 	if err := ctx.Err(); err != nil {

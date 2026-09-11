@@ -157,7 +157,7 @@ func assertIntel275HXSnapshotCapabilities(t *testing.T, reported []tuning.Capabi
 	if !ok {
 		t.Fatal("P-core ratio capability missing")
 	}
-	if ratio.State != tuning.StateSupported || ratio.Unit != tuning.UnitRatio {
+	if ratio.State != tuning.StateReadOnly || ratio.Unit != tuning.UnitRatio {
 		t.Fatalf("P-core ratio capability = %#v", ratio)
 	}
 	if got, want := ratio.Current.Vector, []float64{50, 50, 49, 49, 48, 48, 47, 47}; !reflect.DeepEqual(got, want) {
@@ -168,8 +168,8 @@ func assertIntel275HXSnapshotCapabilities(t *testing.T, reported []tuning.Capabi
 	if !ok {
 		t.Fatal("core voltage capability missing")
 	}
-	if voltage.State != tuning.StateFirmwareLocked {
-		t.Fatalf("core voltage state = %q, want %q", voltage.State, tuning.StateFirmwareLocked)
+	if voltage.State != tuning.StateReadOnly {
+		t.Fatalf("core voltage state = %q, want %q", voltage.State, tuning.StateReadOnly)
 	}
 	if !reflect.DeepEqual(voltage.Current, tuning.Value{}) {
 		t.Fatalf("locked voltage current = %#v, want unset", voltage.Current)

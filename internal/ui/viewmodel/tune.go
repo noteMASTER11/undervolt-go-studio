@@ -45,6 +45,8 @@ type TuneState struct {
 	Pending       []tuning.Change
 	Review        []ReviewRow
 	Effective     map[tuning.ControlID]tuning.Value
+	Remaining     map[tuning.ControlID]tuning.Value
+	Unverified    []tuning.ControlID
 	LastError     string
 }
 
@@ -60,17 +62,23 @@ type ReviewRow struct {
 type Tune struct {
 	service TuneService
 
-	mu         sync.RWMutex
-	state      TuneState
-	listener   StateListener[TuneState]
-	activation uint64
-	cancel     context.CancelFunc
-	closeOnce  sync.Once
-	closeErr   error
+	mu            sync.RWMutex
+	state         TuneState
+	listener      StateListener[TuneState]
+	activation    uint64
+	cancel        context.CancelFunc
+	closeMu       sync.Mutex
+	closed        bool
+	sessionStream bool
 }
 
 func NewTune(service TuneService) *Tune {
-	return &Tune{service: service, state: TuneState{Phase: PhaseIdle, Effective: make(map[tuning.ControlID]tuning.Value)}}
+	vm := &Tune{service: service, state: TuneState{Phase: PhaseIdle, Effective: make(map[tuning.ControlID]tuning.Value)}}
+	if source, ok := service.(interface{ Events() <-chan tuning.Event }); ok {
+		vm.sessionStream = true
+		go vm.consumeEvents(source.Events())
+	}
+	return vm
 }
 
 func (viewModel *Tune) Activate() {
@@ -84,7 +92,7 @@ func (viewModel *Tune) Activate() {
 	token := viewModel.activation
 	ctx, cancel := context.WithCancel(context.Background())
 	viewModel.cancel = cancel
-	if viewModel.state.Phase != PhaseActive {
+	if !viewModel.state.SessionActive && viewModel.state.Phase != PhaseRollbackIncomplete {
 		viewModel.state.Phase = PhaseDiscovering
 	}
 	state, listener := viewModel.stateLocked(), viewModel.listener
@@ -153,6 +161,10 @@ func (viewModel *Tune) Stage(id tuning.ControlID, value tuning.Value) error {
 
 func (viewModel *Tune) Reset() {
 	viewModel.mu.Lock()
+	if viewModel.state.SessionActive || viewModel.state.Phase == PhaseRollbackIncomplete {
+		viewModel.mu.Unlock()
+		return
+	}
 	viewModel.state.Pending = nil
 	viewModel.state.PendingValid = false
 	viewModel.state.Review = nil
@@ -247,6 +259,10 @@ func (viewModel *Tune) Apply(ctx context.Context) error {
 		viewModel.mu.Lock()
 		viewModel.state.Phase = PhaseFailed
 		viewModel.state.LastError = err.Error()
+		var incomplete *tuning.RollbackError
+		if errors.As(err, &incomplete) {
+			viewModel.recordIncompleteLocked(incomplete)
+		}
 		if errors.Is(err, privilegeclient.ErrAuthorizationCancelled) {
 			viewModel.state.Phase = PhaseStaged
 			viewModel.state.LastError = "Authorization cancelled; nothing was changed."
@@ -257,18 +273,22 @@ func (viewModel *Tune) Apply(ctx context.Context) error {
 		return err
 	}
 	viewModel.mu.Lock()
-	viewModel.state.Phase = PhaseApplying
+	if viewModel.state.Phase == PhaseAuthorizing {
+		viewModel.state.Phase = PhaseApplying
+	}
 	state, listener = viewModel.stateLocked(), viewModel.listener
 	viewModel.mu.Unlock()
 	notify(listener, state)
-	go viewModel.consumeEvents(events)
+	if !viewModel.sessionStream {
+		go viewModel.consumeEvents(events)
+	}
 	return nil
 }
 
 func (viewModel *Tune) Revert(ctx context.Context) error {
 	viewModel.setPhase(PhaseRollingBack, "")
 	if err := viewModel.service.Revert(ctx); err != nil {
-		viewModel.setPhase(PhaseRollbackIncomplete, err.Error())
+		viewModel.recordIncomplete(err)
 		return err
 	}
 	viewModel.mu.Lock()
@@ -277,19 +297,29 @@ func (viewModel *Tune) Revert(ctx context.Context) error {
 	viewModel.state.Review = nil
 	viewModel.state.Effective = make(map[tuning.ControlID]tuning.Value)
 	viewModel.state.SessionActive = false
+	viewModel.state.Remaining = nil
+	viewModel.state.Unverified = nil
 	viewModel.mu.Unlock()
 	viewModel.setPhase(PhaseIdle, "")
 	return nil
 }
 
 func (viewModel *Tune) Close() error {
-	viewModel.closeOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		viewModel.closeErr = viewModel.service.Close(ctx)
-		viewModel.Deactivate()
-	})
-	return viewModel.closeErr
+	viewModel.closeMu.Lock()
+	defer viewModel.closeMu.Unlock()
+	if viewModel.closed {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := viewModel.service.Close(ctx)
+	if err != nil {
+		viewModel.recordIncomplete(err)
+		return err
+	}
+	viewModel.Deactivate()
+	viewModel.closed = true
+	return nil
 }
 
 func (viewModel *Tune) SetListener(listener StateListener[TuneState]) {
@@ -321,15 +351,15 @@ func (viewModel *Tune) consumeDiscovery(ctx context.Context, token uint64, resul
 				continue
 			}
 			viewModel.state.Capabilities = cloneCapabilitySet(result.Set)
-			if len(viewModel.state.Pending) > 0 {
+			if len(viewModel.state.Pending) > 0 && viewModel.state.Phase != PhaseRollbackIncomplete {
 				if validationErr := viewModel.validatePendingLocked(); validationErr != nil {
 					viewModel.state.LastError = validationErr.Error()
 				}
 			}
-			if result.Err != nil {
+			if result.Err != nil && viewModel.state.Phase != PhaseRollbackIncomplete {
 				viewModel.state.LastError = result.Err.Error()
 			}
-			if result.Complete {
+			if result.Complete && !viewModel.state.SessionActive && viewModel.state.Phase != PhaseRollbackIncomplete {
 				viewModel.state.Phase = PhaseIdle
 				if len(viewModel.state.Pending) > 0 {
 					viewModel.state.Phase = PhaseStaged
@@ -364,6 +394,38 @@ func (viewModel *Tune) consumeEvents(events <-chan tuning.Event) {
 			viewModel.state.SessionActive = true
 		case "rollback_incomplete":
 			viewModel.state.Phase = PhaseRollbackIncomplete
+			viewModel.state.SessionActive = true
+			viewModel.state.LastError = event.Message
+			viewModel.state.Remaining = event.Remaining
+			viewModel.state.Unverified = append([]tuning.ControlID(nil), event.Unverified...)
+		case "session_terminated":
+			viewModel.state.Phase = PhaseRollbackIncomplete
+			viewModel.state.SessionActive = true
+			if viewModel.state.LastError == "" {
+				viewModel.state.LastError = event.Message
+			}
+			if len(viewModel.state.Unverified) == 0 {
+				for _, change := range viewModel.state.Pending {
+					if _, ok := viewModel.state.Remaining[change.ID]; !ok {
+						viewModel.state.Unverified = append(viewModel.state.Unverified, change.ID)
+					}
+				}
+			}
+		case "session_closed":
+			if !viewModel.state.SessionActive {
+				break
+			}
+			fallthrough
+		case "rollback_complete":
+			viewModel.state.Phase = PhaseIdle
+			viewModel.state.SessionActive = false
+			viewModel.state.Pending = nil
+			viewModel.state.PendingValid = false
+			viewModel.state.Review = nil
+			viewModel.state.Remaining = nil
+			viewModel.state.Unverified = nil
+			viewModel.state.LastError = ""
+			viewModel.state.Effective = make(map[tuning.ControlID]tuning.Value)
 		case "transaction_failed", "failed":
 			viewModel.state.Phase = PhaseFailed
 			viewModel.state.SessionActive = false
@@ -395,7 +457,33 @@ func (viewModel *Tune) stateLocked() TuneState {
 	for id, value := range viewModel.state.Effective {
 		state.Effective[id] = cloneValue(value)
 	}
+	state.Remaining = make(map[tuning.ControlID]tuning.Value, len(viewModel.state.Remaining))
+	for id, value := range viewModel.state.Remaining {
+		state.Remaining[id] = cloneValue(value)
+	}
+	state.Unverified = append([]tuning.ControlID(nil), viewModel.state.Unverified...)
 	return state
+}
+
+func (viewModel *Tune) recordIncompleteLocked(err *tuning.RollbackError) {
+	viewModel.state.Phase = PhaseRollbackIncomplete
+	viewModel.state.SessionActive = true
+	viewModel.state.LastError = err.Error()
+	if err.Remaining != nil || len(err.Unverified) > 0 {
+		viewModel.state.Remaining = err.Remaining
+		viewModel.state.Unverified = err.Unverified
+	}
+}
+func (viewModel *Tune) recordIncomplete(err error) {
+	viewModel.mu.Lock()
+	var incomplete *tuning.RollbackError
+	if !errors.As(err, &incomplete) {
+		incomplete = &tuning.RollbackError{Cause: err}
+	}
+	viewModel.recordIncompleteLocked(incomplete)
+	state, listener := viewModel.stateLocked(), viewModel.listener
+	viewModel.mu.Unlock()
+	notify(listener, state)
 }
 
 func (viewModel *Tune) validatePendingLocked() error {

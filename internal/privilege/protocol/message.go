@@ -7,14 +7,18 @@ import (
 )
 
 const (
-	Version      = 1
-	MaxFrameSize = 1 << 20
+	Version         = 1
+	MaxFrameSize    = 1 << 20
+	MaxMetadataSize = 128
+	// Increment when helper safety semantics change, independently of framing.
+	HelperBuildIdentity = "undervolt-go-studio-helper/intel-safety-2"
 )
 
 type Type string
 
 const (
 	TypeHello              Type = "hello"
+	TypeReady              Type = "hello_ack"
 	TypeProbe              Type = "probe_privileged"
 	TypeBegin              Type = "begin_transaction"
 	TypeRenew              Type = "renew_lease"
@@ -50,6 +54,10 @@ type HelloPayload struct {
 	Build  string `json:"build,omitempty"`
 }
 
+type HelperPayload struct {
+	Build string `json:"build"`
+}
+
 type ProbePayload struct{}
 
 type BeginPayload struct {
@@ -74,14 +82,15 @@ type AppliedPayload struct {
 }
 
 type FailurePayload struct {
-	Message   string                            `json:"message"`
-	Effective map[tuning.ControlID]tuning.Value `json:"effective,omitempty"`
-	Remaining map[tuning.ControlID]tuning.Value `json:"remaining,omitempty"`
+	Message    string                            `json:"message"`
+	Effective  map[tuning.ControlID]tuning.Value `json:"effective,omitempty"`
+	Remaining  map[tuning.ControlID]tuning.Value `json:"remaining,omitempty"`
+	Unverified []tuning.ControlID                `json:"unverified,omitempty"`
 }
 
 func knownType(messageType Type) bool {
 	switch messageType {
-	case TypeHello, TypeProbe, TypeBegin, TypeRenew, TypeRevert, TypeClose,
+	case TypeHello, TypeReady, TypeProbe, TypeBegin, TypeRenew, TypeRevert, TypeClose,
 		TypeCapabilities, TypeReviewChanged, TypeProgress, TypeApplied, TypeFailed,
 		TypeRollbackProgress, TypeRollbackComplete, TypeRollbackIncomplete:
 		return true

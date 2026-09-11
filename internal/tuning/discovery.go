@@ -173,15 +173,16 @@ func cloneCapability(capability Capability) Capability {
 }
 
 type generationCapability struct {
-	ID           ControlID
-	State        CapabilityState
-	Unit         Unit
-	Current      Value
-	Range        *NumericRange
-	Choices      []string
-	DriverID     string
-	ReasonCode   string
-	Experimental bool
+	SourceRevision string
+	ID             ControlID
+	State          CapabilityState
+	Unit           Unit
+	Current        Value
+	Range          *NumericRange
+	Choices        []string
+	DriverID       string
+	ReasonCode     string
+	Experimental   bool
 }
 
 func generationFor(set CapabilitySet) string {
@@ -191,15 +192,16 @@ func generationFor(set CapabilitySet) string {
 	}{MachineID: set.MachineID, Capabilities: make([]generationCapability, 0, len(set.Capabilities))}
 	for _, capability := range set.Capabilities {
 		signature.Capabilities = append(signature.Capabilities, generationCapability{
-			ID:           capability.ID,
-			State:        capability.State,
-			Unit:         capability.Unit,
-			Current:      capability.Current,
-			Range:        capability.Range,
-			Choices:      capability.Choices,
-			DriverID:     capability.DriverID,
-			ReasonCode:   capability.ReasonCode,
-			Experimental: capability.Experimental,
+			SourceRevision: capability.SourceRevision,
+			ID:             capability.ID,
+			State:          capability.State,
+			Unit:           capability.Unit,
+			Current:        capability.Current,
+			Range:          capability.Range,
+			Choices:        capability.Choices,
+			DriverID:       capability.DriverID,
+			ReasonCode:     capability.ReasonCode,
+			Experimental:   capability.Experimental,
 		})
 	}
 	encoded, _ := json.Marshal(signature)

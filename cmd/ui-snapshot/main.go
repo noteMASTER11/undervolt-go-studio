@@ -290,8 +290,8 @@ func (intel275HXSnapshotService) Discover(context.Context) <-chan tuning.Discove
 			{ID: tuning.ControlPL2, Label: "Short boost power", Scope: "CPU package", Unit: tuning.UnitWatt, State: tuning.StateSupported, Current: tuning.NumericValue(44), Range: &tuning.NumericRange{Minimum: 15, Maximum: 120, Step: 1}},
 			{ID: tuning.ControlEPP, Label: "Energy performance preference", Scope: "Intel P-state policy", Unit: tuning.UnitChoice, State: tuning.StateSupported, Current: tuning.ChoiceValue("balanced"), Choices: []string{"performance", "balanced", "power saver"}},
 			{ID: tuning.ControlThermalLimit, Label: "Thermal ceiling", Scope: "CPU package", Unit: tuning.UnitCelsius, State: tuning.StateSupported, Current: tuning.NumericValue(95), Range: &tuning.NumericRange{Minimum: 70, Maximum: 100, Step: 1}},
-			{ID: tuning.ControlRatioPCore, Label: "P-core turbo ratios", Scope: "1–8 active performance cores", Unit: tuning.UnitRatio, State: tuning.StateSupported, Current: tuning.VectorValue([]float64{50, 50, 49, 49, 48, 48, 47, 47})},
-			{ID: tuning.ControlVoltageCore, Label: "Core voltage offset", Scope: "CPU core plane", Unit: tuning.UnitMilliVolt, State: tuning.StateFirmwareLocked, Reason: "BIOS firmware lock is enabled"},
+			{ID: tuning.ControlRatioPCore, Label: "P-core turbo ratios", Scope: "1–8 active performance cores", Unit: tuning.UnitRatio, State: tuning.StateReadOnly, Current: tuning.VectorValue([]float64{50, 50, 49, 49, 48, 48, 47, 47}), Reason: "Writability and stock restoration are unverified"},
+			{ID: tuning.ControlVoltageCore, Label: "Core voltage offset", Scope: "CPU core plane", Unit: tuning.UnitMilliVolt, State: tuning.StateReadOnly, Reason: "Voltage lock state and restoration are unverified"},
 		},
 	}, Complete: true}
 	close(results)

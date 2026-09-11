@@ -89,6 +89,7 @@ type NumericRange struct {
 }
 
 type Capability struct {
+	SourceRevision    string          `json:"-"`
 	ID                ControlID       `json:"id"`
 	Scope             string          `json:"scope,omitempty"`
 	Label             string          `json:"label,omitempty"`
@@ -199,6 +200,7 @@ type Event struct {
 	Capabilities *CapabilitySet      `json:"capabilities,omitempty"`
 	Effective    map[ControlID]Value `json:"effective,omitempty"`
 	Remaining    map[ControlID]Value `json:"remaining,omitempty"`
+	Unverified   []ControlID         `json:"unverified,omitempty"`
 }
 
 func isVoltageControl(id ControlID) bool {
