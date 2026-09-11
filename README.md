@@ -2,6 +2,20 @@
 
 > **Development status:** This repository is the experimental Undervolt Go Studio fork of [Softorage/undervolt-go](https://github.com/Softorage/undervolt-go). It retains the upstream history and GPL-3.0 license while developing an unprivileged, asynchronous monitoring and tuning workstation for Linux. The original Undervolt Go interface described below remains available during the migration.
 
+## Studio alpha: read-only monitoring
+
+The current Studio milestone is a normal-user, read-only hardware monitor. It starts without `sudo` or `pkexec`, downloads nothing at runtime, and polls only metrics requested by the active Overview or Monitor page. Providers read Linux `sysfs`, `procfs`, and `hwmon` directly in isolated background workers; slow or missing sensors do not block navigation.
+
+```bash
+go test ./...
+go build -o build/undervolt-go-studio ./cmd/studio
+./build/undervolt-go-studio
+```
+
+Overview subscribes to a small CPU summary. Monitor is constructed only when opened, defaults to at most four metrics, offers 100 ms–5 s intervals, and releases its subscription when closed. Hardware exposes provider latency, health, consumers, and dropped-frame counters. Tune, Stress Tests, Profiles, and Reports are visible roadmap destinations but remain disabled or informational in this milestone; no privileged settings are changed.
+
+The approved direction and implementation details are recorded in the [Studio design](docs/superpowers/specs/2026-09-11-undervolt-go-studio-design.md) and [foundation/telemetry plan](docs/superpowers/plans/2026-09-11-foundation-telemetry.md).
+
 **Undervolt Go** is a power-utility, designed to allow users to undervolt Intel CPUs on Linux systems. Undervolting can help reduce CPU temperatures, decrease power consumption, and potentially increase system stability and longevity. **Undervolt Go** gives the advantage of running the application without the need for any dependencies, and also features a user-friendly graphical version.
 
 Get it [here](https://softorage.github.io/undervolt-go/).
