@@ -24,26 +24,37 @@ type Monitor struct {
 	intervals   []time.Duration
 	active      bool
 
-	search     *widget.Entry
-	interval   *widget.Select
-	pause      *widget.Button
-	metricList *fyne.Container
-	values     *fyne.Container
-	chartHost  *fyne.Container
-	timelines  map[telemetry.Unit]*components.Timeline
-	chartKey   string
-	updates    *components.LatestDispatcher[viewmodel.MonitorState]
-	root       fyne.CanvasObject
+	search      *widget.Entry
+	interval    *widget.Select
+	pause       *widget.Button
+	metricList  *fyne.Container
+	values      *fyne.Container
+	chartHost   *fyne.Container
+	timelines   map[telemetry.Unit]*components.Timeline
+	chartKey    string
+	updates     *components.LatestDispatcher[viewmodel.MonitorState]
+	afterRender func(viewmodel.MonitorState)
+	root        fyne.CanvasObject
 }
 
 func NewMonitor(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) *Monitor {
+	return newMonitor(source, catalog, nil)
+}
+
+// NewMonitorWithRenderCallback reports each completed UI render to deterministic snapshot callers.
+func NewMonitorWithRenderCallback(source viewmodel.SubscriptionSource, catalog telemetry.Catalog, afterRender func(viewmodel.MonitorState)) *Monitor {
+	return newMonitor(source, catalog, afterRender)
+}
+
+func newMonitor(source viewmodel.SubscriptionSource, catalog telemetry.Catalog, afterRender func(viewmodel.MonitorState)) *Monitor {
 	page := &Monitor{
 		vm:          viewmodel.NewMonitor(source, 250*time.Millisecond),
 		descriptors: make(map[telemetry.MetricID]telemetry.Descriptor),
 		selected:    make(map[telemetry.MetricID]bool),
 		intervals:   []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 5 * time.Second},
 		metricList:  container.NewVBox(), values: container.NewVBox(), chartHost: container.NewVBox(),
-		timelines: make(map[telemetry.Unit]*components.Timeline),
+		timelines:   make(map[telemetry.Unit]*components.Timeline),
+		afterRender: afterRender,
 	}
 	page.search = widget.NewEntry()
 	page.search.SetPlaceHolder("Search metrics")
@@ -204,6 +215,9 @@ func (p *Monitor) render(state viewmodel.MonitorState) {
 	}
 	for _, group := range groups {
 		p.timelines[group.Unit].SetSeries(group.Series)
+	}
+	if p.afterRender != nil {
+		p.afterRender(state)
 	}
 }
 

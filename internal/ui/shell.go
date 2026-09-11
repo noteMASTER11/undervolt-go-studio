@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/noteMASTER11/undervolt-go-studio/internal/events"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/pages"
@@ -18,26 +21,78 @@ type Shell struct {
 	scheduler *telemetry.Scheduler
 	catalog   telemetry.Catalog
 	navigator *LazyNavigator
+	events    *events.Store
+	tune      *viewmodel.Tune
 	center    *fyne.Container
 	root      fyne.CanvasObject
 
-	statusLabel  *widget.Label
-	applyButton  *widget.Button
-	revertButton *widget.Button
+	statusLabel *widget.Label
+	hardware    *pages.Hardware
 }
 
 func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
-	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack()}
+	eventStore := events.NewStore(0)
+	return newShell(info, scheduler, eventStore, newDesktopTuneService(info.Version, eventStore), fyne.Do)
+}
+
+// NewShellWithHardwareSummary creates a shell whose Hardware page displays a
+// supplied summary. It supports deterministic headless documentation views.
+func NewShellWithHardwareSummary(info product.Info, scheduler *telemetry.Scheduler, summary pages.HardwareSummary) *Shell {
+	eventStore := events.NewStore(0)
+	shell := newShell(info, scheduler, eventStore, newDesktopTuneService(info.Version, eventStore), fyne.Do)
+	for index, factory := range shell.navigator.factories {
+		if factory.ID != "hardware" {
+			continue
+		}
+		shell.navigator.factories[index].Create = func() Page {
+			shell.hardware = pages.NewHardwareWithSummary(info, scheduler, shell.catalog, summary)
+			return shell.hardware
+		}
+		shell.navigator.byID["hardware"] = shell.navigator.factories[index]
+		break
+	}
+	return shell
+}
+
+// NewSnapshotShell configures telemetry pages to report after their UI callback
+// has rendered the latest state. It is only used by deterministic headless views.
+func NewSnapshotShell(info product.Info, scheduler *telemetry.Scheduler, summary pages.HardwareSummary, afterRender func(viewmodel.MonitorState)) *Shell {
+	shell := NewShellWithHardwareSummary(info, scheduler, summary)
+	shell.navigator.Deactivate()
+	delete(shell.navigator.pages, "overview")
 	source := viewmodel.SchedulerSource{Scheduler: scheduler}
+	for index, factory := range shell.navigator.factories {
+		switch factory.ID {
+		case "overview":
+			shell.navigator.factories[index].Create = func() Page { return pages.NewOverviewWithRenderCallback(source, shell.catalog, afterRender) }
+		case "monitor":
+			shell.navigator.factories[index].Create = func() Page { return pages.NewMonitorWithRenderCallback(source, shell.catalog, afterRender) }
+		default:
+			continue
+		}
+		shell.navigator.byID[factory.ID] = shell.navigator.factories[index]
+	}
+	return shell
+}
+
+func newShell(info product.Info, scheduler *telemetry.Scheduler, eventStore *events.Store, tuneService viewmodel.TuneService, dispatch func(func())) *Shell {
+	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack(), events: eventStore}
+	source := viewmodel.SchedulerSource{Scheduler: scheduler}
+	shell.tune = viewmodel.NewTune(tuneService)
 	factories := []PageFactory{
 		{ID: "overview", Label: "Overview", Icon: theme.HomeIcon(), Create: func() Page { return pages.NewOverview(source, shell.catalog) }},
 		{ID: "monitor", Label: "Monitor", Icon: theme.VisibilityIcon(), Create: func() Page { return pages.NewMonitor(source, shell.catalog) }},
-		placeholderFactory("tune", "Tune", theme.SettingsIcon(), "Tuning is disabled in the read-only milestone."),
+		{ID: "tune", Label: "Tune", Icon: theme.SettingsIcon(), Create: func() Page {
+			return pages.NewTuneWithDispatcher(shell.tune, source, shell.catalog, dispatch)
+		}},
 		placeholderFactory("stress", "Stress Tests", theme.MediaPlayIcon(), "Stress engines are delivered in a later milestone."),
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
 		placeholderFactory("reports", "Reports", theme.DocumentIcon(), "Reports are delivered after session recording."),
-		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page { return pages.NewHardware(info, scheduler, shell.catalog) }},
-		placeholderFactory("logs", "Logs", theme.ListIcon(), "No Studio events have been recorded."),
+		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page {
+			shell.hardware = pages.NewHardware(info, scheduler, shell.catalog)
+			return shell.hardware
+		}},
+		{ID: "logs", Label: "Logs", Icon: theme.ListIcon(), Create: func() Page { return pages.NewLogs(shell.events) }},
 	}
 	shell.navigator = NewLazyNavigator(factories)
 
@@ -57,11 +112,6 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 	)
 
 	shell.statusLabel = widget.NewLabel("Discovering hardware…")
-	shell.applyButton = widget.NewButton("Apply", nil)
-	shell.revertButton = widget.NewButton("Revert", nil)
-	shell.applyButton.Disable()
-	shell.revertButton.Disable()
-
 	header := container.NewPadded(container.NewBorder(
 		nil, nil, nil,
 		container.NewHBox(shell.statusLabel, widget.NewSeparator(), widget.NewLabel(info.Version)),
@@ -104,6 +154,21 @@ func (s *Shell) SetCatalog(catalog telemetry.Catalog) {
 
 func (s *Shell) Deactivate() {
 	s.navigator.Deactivate()
+}
+
+func (s *Shell) CloseTune() error {
+	if s.tune == nil {
+		return nil
+	}
+	return s.tune.Close()
+}
+
+// WaitForHardwareSummary waits for the selected Hardware page to render its summary.
+func (s *Shell) WaitForHardwareSummary(ctx context.Context) error {
+	if s.hardware == nil {
+		return errors.New("hardware page is not selected")
+	}
+	return s.hardware.WaitForSummary(ctx)
 }
 
 func placeholderFactory(id, label string, icon fyne.Resource, message string) PageFactory {

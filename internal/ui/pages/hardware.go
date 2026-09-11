@@ -3,6 +3,7 @@ package pages
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -17,6 +18,20 @@ import (
 
 type HardwareSource interface {
 	Diagnostics() []telemetry.ProviderDiagnostics
+}
+
+// HardwareSummary is the host information rendered by the Hardware page.
+// Snapshot callers can provide a verified summary without probing the host.
+type HardwareSummary struct {
+	Machine       string
+	OS            string
+	Kernel        string
+	CPU           string
+	CPUDetails    []string
+	Graphics      []string
+	Memory        string
+	MemoryDetails []string
+	Storage       []string
 }
 
 type diagnosticsRow struct {
@@ -34,6 +49,7 @@ type Hardware struct {
 	info    product.Info
 	source  HardwareSource
 	catalog telemetry.Catalog
+	summary func(context.Context, telemetry.Catalog) HardwareSummary
 
 	mu              sync.Mutex
 	active          bool
@@ -42,6 +58,7 @@ type Hardware struct {
 	rows            []diagnosticsRow
 	summaryRevision uint64
 	summaryCancel   context.CancelFunc
+	summaryReady    chan struct{}
 	summaryLoaded   bool
 
 	status      *widget.Label
@@ -50,7 +67,21 @@ type Hardware struct {
 }
 
 func NewHardware(info product.Info, source HardwareSource, catalog telemetry.Catalog) *Hardware {
-	page := &Hardware{info: info, source: source, catalog: cloneCatalog(catalog)}
+	page := newHardware(info, source, catalog, readHardwareOverview)
+	page.SetCatalog(catalog)
+	return page
+}
+
+// NewHardwareWithSummary creates a Hardware page that displays a supplied,
+// verified summary. It is used by deterministic headless documentation views.
+func NewHardwareWithSummary(info product.Info, source HardwareSource, catalog telemetry.Catalog, summary HardwareSummary) *Hardware {
+	page := newHardware(info, source, catalog, func(context.Context, telemetry.Catalog) HardwareSummary { return summary })
+	page.setSummary(summary)
+	return page
+}
+
+func newHardware(info product.Info, source HardwareSource, catalog telemetry.Catalog, summary func(context.Context, telemetry.Catalog) HardwareSummary) *Hardware {
+	page := &Hardware{info: info, source: source, catalog: cloneCatalog(catalog), summary: summary}
 	page.status = widget.NewLabel("Checking telemetry sources…")
 	page.summaryHost = container.NewStack(container.NewCenter(widget.NewLabel("Loading hardware overview…")))
 	copyButton := widget.NewButton("Copy Diagnostics", page.copyDiagnostics)
@@ -60,12 +91,22 @@ func NewHardware(info product.Info, source HardwareSource, catalog telemetry.Cat
 		page.status,
 	))
 	page.root = container.NewPadded(container.NewBorder(header, nil, nil, nil, page.summaryHost))
-	page.SetCatalog(catalog)
 	page.setDiagnostics(source.Diagnostics())
 	return page
 }
 
-func hardwareOverviewObject(overview hardwareOverview) fyne.CanvasObject {
+func (p *Hardware) setSummary(summary HardwareSummary) {
+	ready := make(chan struct{})
+	p.summaryHost.Objects = []fyne.CanvasObject{hardwareOverviewObject(summary)}
+	p.summaryHost.Refresh()
+	p.mu.Lock()
+	p.summaryReady = ready
+	p.summaryLoaded = true
+	p.mu.Unlock()
+	close(ready)
+}
+
+func hardwareOverviewObject(overview HardwareSummary) fyne.CanvasObject {
 	body := container.NewVBox(
 		container.NewGridWithColumns(2,
 			hardwareCard("System", overview.Machine, overview.OS, overview.Kernel),
@@ -133,6 +174,8 @@ func (p *Hardware) SetCatalog(catalog telemetry.Catalog) {
 	revision := p.summaryRevision
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	p.summaryCancel = cancel
+	ready := make(chan struct{})
+	p.summaryReady = ready
 	p.summaryLoaded = false
 	p.mu.Unlock()
 	if previousCancel != nil {
@@ -142,7 +185,7 @@ func (p *Hardware) SetCatalog(catalog telemetry.Catalog) {
 	p.summaryHost.Refresh()
 	go func() {
 		defer cancel()
-		overview := readHardwareOverview(ctx, catalog)
+		overview := p.summary(ctx, catalog)
 		fyne.Do(func() {
 			p.mu.Lock()
 			current := p.summaryRevision == revision
@@ -156,8 +199,25 @@ func (p *Hardware) SetCatalog(catalog telemetry.Catalog) {
 			}
 			p.summaryHost.Objects = []fyne.CanvasObject{hardwareOverviewObject(overview)}
 			p.summaryHost.Refresh()
+			close(ready)
 		})
 	}()
+}
+
+// WaitForSummary waits until the current Hardware summary has reached the UI.
+func (p *Hardware) WaitForSummary(ctx context.Context) error {
+	p.mu.Lock()
+	ready := p.summaryReady
+	p.mu.Unlock()
+	if ready == nil {
+		return errors.New("hardware summary is not loading")
+	}
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (p *Hardware) refreshLoop(stop <-chan struct{}, done chan<- struct{}) {

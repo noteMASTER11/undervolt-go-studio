@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
 
@@ -37,10 +38,20 @@ type Overview struct {
 	chartHost        *fyne.Container
 	updates          *components.LatestDispatcher[viewmodel.MonitorState]
 	frequencyHistory []telemetry.Sample
+	afterRender      func(viewmodel.MonitorState)
 	root             fyne.CanvasObject
 }
 
 func NewOverview(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) *Overview {
+	return newOverview(source, catalog, nil)
+}
+
+// NewOverviewWithRenderCallback reports each completed UI render to deterministic snapshot callers.
+func NewOverviewWithRenderCallback(source viewmodel.SubscriptionSource, catalog telemetry.Catalog, afterRender func(viewmodel.MonitorState)) *Overview {
+	return newOverview(source, catalog, afterRender)
+}
+
+func newOverview(source viewmodel.SubscriptionSource, catalog telemetry.Catalog, afterRender func(viewmodel.MonitorState)) *Overview {
 	page := &Overview{
 		vm:          viewmodel.NewOverview(source, catalog, 250*time.Millisecond),
 		descriptors: make(map[telemetry.MetricID]telemetry.Descriptor),
@@ -48,6 +59,7 @@ func NewOverview(source viewmodel.SubscriptionSource, catalog telemetry.Catalog)
 		cardGrid:    container.NewGridWithColumns(3),
 		charts:      make(map[string]*components.Timeline),
 		chartHost:   container.NewStack(),
+		afterRender: afterRender,
 	}
 	page.root = container.NewPadded(container.NewBorder(
 		container.NewVBox(
@@ -136,6 +148,9 @@ func (p *Overview) render(state viewmodel.MonitorState) {
 			Points: recentSamples(p.frequencyHistory, cutoff),
 		}})
 	}
+	if p.afterRender != nil {
+		p.afterRender(state)
+	}
 }
 
 func (p *Overview) appendAverageFrequency(state viewmodel.MonitorState) {
@@ -191,10 +206,16 @@ func overviewChartLayout(charts []fyne.CanvasObject) fyne.CanvasObject {
 	case 1:
 		return charts[0]
 	case 2:
-		return container.NewGridWithColumns(2, charts...)
+		return container.NewGridWithColumns(2, overviewChartCell(charts[0]), overviewChartCell(charts[1]))
 	default:
-		return container.NewGridWithRows(2, container.NewGridWithColumns(2, charts[0], charts[1]), charts[2])
+		return container.NewGridWithRows(3, overviewChartCell(charts[0]), overviewChartCell(charts[1]), overviewChartCell(charts[2]))
 	}
+}
+
+func overviewChartCell(chart fyne.CanvasObject) fyne.CanvasObject {
+	rightInset := canvas.NewRectangle(color.Transparent)
+	rightInset.SetMinSize(fyne.NewSize(48, 1))
+	return container.NewPadded(container.NewBorder(nil, nil, nil, rightInset, chart))
 }
 
 func averageSample(samples map[telemetry.MetricID]telemetry.Sample, metricIDs []telemetry.MetricID) (telemetry.Sample, bool) {
