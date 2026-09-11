@@ -28,6 +28,9 @@ profile.cov
 go.work
 go.work.sum
 
+# Local Git worktrees
+/.worktrees/
+
 # VS Code
 .vscode/
 
