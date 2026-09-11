@@ -54,6 +54,27 @@ func NewShellWithHardwareSummary(info product.Info, scheduler *telemetry.Schedul
 	return shell
 }
 
+// NewSnapshotShell configures telemetry pages to report after their UI callback
+// has rendered the latest state. It is only used by deterministic headless views.
+func NewSnapshotShell(info product.Info, scheduler *telemetry.Scheduler, summary pages.HardwareSummary, afterRender func(viewmodel.MonitorState)) *Shell {
+	shell := NewShellWithHardwareSummary(info, scheduler, summary)
+	shell.navigator.Deactivate()
+	delete(shell.navigator.pages, "overview")
+	source := viewmodel.SchedulerSource{Scheduler: scheduler}
+	for index, factory := range shell.navigator.factories {
+		switch factory.ID {
+		case "overview":
+			shell.navigator.factories[index].Create = func() Page { return pages.NewOverviewWithRenderCallback(source, shell.catalog, afterRender) }
+		case "monitor":
+			shell.navigator.factories[index].Create = func() Page { return pages.NewMonitorWithRenderCallback(source, shell.catalog, afterRender) }
+		default:
+			continue
+		}
+		shell.navigator.byID[factory.ID] = shell.navigator.factories[index]
+	}
+	return shell
+}
+
 func newShell(info product.Info, scheduler *telemetry.Scheduler, eventStore *events.Store, tuneService viewmodel.TuneService, dispatch func(func())) *Shell {
 	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack(), events: eventStore}
 	source := viewmodel.SchedulerSource{Scheduler: scheduler}

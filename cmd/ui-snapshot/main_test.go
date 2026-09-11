@@ -14,6 +14,7 @@ import (
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
+	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/viewmodel"
 )
 
 func TestIntel275HXSnapshotServiceReportsRequiredCapabilitiesHonestly(t *testing.T) {
@@ -96,6 +97,38 @@ func TestIntel275HXTelemetrySnapshotWaitsForChartHistory(t *testing.T) {
 	}
 	if err := provider.wait(context.Background()); err != nil {
 		t.Fatalf("snapshot did not become ready with chart history: %v", err)
+	}
+}
+
+func TestIntel275HXTelemetrySnapshotUsesFixedTimeline(t *testing.T) {
+	provider := newIntel275HXTelemetrySnapshotProvider()
+	metricIDs := []telemetry.MetricID{"cpu.utilization"}
+	first, err := provider.Sample(context.Background(), metricIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := provider.Sample(context.Background(), metricIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := first.Samples[0].Timestamp, intel275HXSnapshotTimeline[0]; !got.Equal(want) {
+		t.Fatalf("first sample timestamp = %v, want %v", got, want)
+	}
+	if got, want := second.Samples[0].Timestamp, intel275HXSnapshotTimeline[1]; !got.Equal(want) {
+		t.Fatalf("second sample timestamp = %v, want %v", got, want)
+	}
+}
+
+func TestIntel275HXSnapshotReadinessRequiresFinalRenderedFrame(t *testing.T) {
+	state := viewmodel.MonitorState{Current: map[telemetry.MetricID]telemetry.Sample{
+		"cpu.utilization": {Timestamp: intel275HXSnapshotTimeline[1]},
+	}}
+	if stateHasSnapshotTimeline(state) {
+		t.Fatal("penultimate telemetry frame marked snapshot ready")
+	}
+	state.Current["cpu.utilization"] = telemetry.Sample{Timestamp: intel275HXSnapshotTimeline[2]}
+	if !stateHasSnapshotTimeline(state) {
+		t.Fatal("final rendered telemetry frame did not mark snapshot ready")
 	}
 }
 

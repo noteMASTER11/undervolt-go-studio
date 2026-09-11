@@ -110,6 +110,13 @@ func snapshotPage(page, scenario string) (*snapshotPageResult, error) {
 
 func intel275HXTelemetrySnapshotPage(page string) (*snapshotPageResult, error) {
 	provider := newIntel275HXTelemetrySnapshotProvider()
+	rendered := make(chan struct{})
+	var renderedOnce sync.Once
+	afterRender := func(state viewmodel.MonitorState) {
+		if stateHasSnapshotTimeline(state) {
+			renderedOnce.Do(func() { close(rendered) })
+		}
+	}
 	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, telemetry.SchedulerOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	catalog, err := scheduler.Discover(ctx)
@@ -117,7 +124,7 @@ func intel275HXTelemetrySnapshotPage(page string) (*snapshotPageResult, error) {
 		cancel()
 		return nil, fmt.Errorf("discover Intel 275HX snapshot telemetry: %w", err)
 	}
-	shell := ui.NewShellWithHardwareSummary(product.Current("snapshot"), scheduler, intel275HXHardwareSummary())
+	shell := ui.NewSnapshotShell(product.Current("snapshot"), scheduler, intel275HXHardwareSummary(), afterRender)
 	shell.SetCatalog(catalog)
 	shell.SetStatus("Intel Core Ultra 9 275HX · deterministic preview")
 	if err := shell.Select(page); err != nil {
@@ -138,14 +145,29 @@ func intel275HXTelemetrySnapshotPage(page string) (*snapshotPageResult, error) {
 					return fmt.Errorf("wait for Intel 275HX hardware summary: %w", err)
 				}
 			} else {
-				if err := provider.wait(waitCtx); err != nil {
-					return err
+				select {
+				case <-rendered:
+				case <-waitCtx.Done():
+					return fmt.Errorf("wait for rendered Intel 275HX telemetry: %w", waitCtx.Err())
 				}
 			}
 			fyne.DoAndWait(func() {})
 			return nil
 		},
 	}, nil
+}
+
+func stateHasSnapshotTimeline(state viewmodel.MonitorState) bool {
+	if len(intel275HXSnapshotTimeline) == 0 {
+		return false
+	}
+	final := intel275HXSnapshotTimeline[len(intel275HXSnapshotTimeline)-1]
+	for _, sample := range state.Current {
+		if sample.Timestamp.Equal(final) {
+			return true
+		}
+	}
+	return false
 }
 
 func intel275HXHardwareSummary() pages.HardwareSummary {
@@ -166,6 +188,12 @@ type intel275HXTelemetrySnapshotProvider struct {
 	sampled chan struct{}
 	once    sync.Once
 	samples atomic.Int32
+}
+
+var intel275HXSnapshotTimeline = []time.Time{
+	time.Date(2099, time.January, 2, 15, 4, 5, 0, time.UTC),
+	time.Date(2099, time.January, 2, 15, 4, 6, 0, time.UTC),
+	time.Date(2099, time.January, 2, 15, 4, 7, 0, time.UTC),
 }
 
 func newIntel275HXTelemetrySnapshotProvider() *intel275HXTelemetrySnapshotProvider {
@@ -192,7 +220,11 @@ func (p *intel275HXTelemetrySnapshotProvider) Discover(context.Context) (telemet
 }
 
 func (p *intel275HXTelemetrySnapshotProvider) Sample(_ context.Context, metricIDs []telemetry.MetricID) (telemetry.Frame, error) {
-	now := time.Now()
+	index := int(p.samples.Add(1) - 1)
+	if index >= len(intel275HXSnapshotTimeline) {
+		index = len(intel275HXSnapshotTimeline) - 1
+	}
+	now := intel275HXSnapshotTimeline[index]
 	values := map[telemetry.MetricID]float64{
 		"cpu.utilization":         37.0,
 		"cpu.package.temperature": 71.0,
@@ -203,7 +235,7 @@ func (p *intel275HXTelemetrySnapshotProvider) Sample(_ context.Context, metricID
 	for _, metricID := range metricIDs {
 		samples = append(samples, telemetry.Sample{MetricID: metricID, Value: values[metricID], Timestamp: now, Quality: telemetry.QualityGood})
 	}
-	if p.samples.Add(1) >= 3 {
+	if index >= 2 {
 		p.once.Do(func() { close(p.sampled) })
 	}
 	return telemetry.Frame{ProviderID: p.ID(), StartedAt: now, FinishedAt: now, Samples: samples}, nil
