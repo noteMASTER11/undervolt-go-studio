@@ -6,6 +6,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/noteMASTER11/undervolt-go-studio/internal/events"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/pages"
@@ -18,6 +19,7 @@ type Shell struct {
 	scheduler *telemetry.Scheduler
 	catalog   telemetry.Catalog
 	navigator *LazyNavigator
+	events    *events.Store
 	center    *fyne.Container
 	root      fyne.CanvasObject
 
@@ -27,7 +29,7 @@ type Shell struct {
 }
 
 func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
-	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack()}
+	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack(), events: events.NewStore(0)}
 	source := viewmodel.SchedulerSource{Scheduler: scheduler}
 	factories := []PageFactory{
 		{ID: "overview", Label: "Overview", Icon: theme.HomeIcon(), Create: func() Page { return pages.NewOverview(source, shell.catalog) }},
@@ -37,7 +39,7 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
 		placeholderFactory("reports", "Reports", theme.DocumentIcon(), "Reports are delivered after session recording."),
 		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page { return pages.NewHardware(info, scheduler, shell.catalog) }},
-		placeholderFactory("logs", "Logs", theme.ListIcon(), "No Studio events have been recorded."),
+		{ID: "logs", Label: "Logs", Icon: theme.ListIcon(), Create: func() Page { return pages.NewLogs(shell.events) }},
 	}
 	shell.navigator = NewLazyNavigator(factories)
 
