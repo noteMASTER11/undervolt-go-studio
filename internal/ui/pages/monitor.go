@@ -29,7 +29,9 @@ type Monitor struct {
 	pause      *widget.Button
 	metricList *fyne.Container
 	values     *fyne.Container
-	timeline   *components.Timeline
+	chartHost  *fyne.Container
+	timelines  map[telemetry.Unit]*components.Timeline
+	chartKey   string
 	updates    *components.LatestDispatcher[viewmodel.MonitorState]
 	root       fyne.CanvasObject
 }
@@ -40,7 +42,8 @@ func NewMonitor(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) 
 		descriptors: make(map[telemetry.MetricID]telemetry.Descriptor),
 		selected:    make(map[telemetry.MetricID]bool),
 		intervals:   []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second, 5 * time.Second},
-		metricList:  container.NewVBox(), values: container.NewVBox(), timeline: components.NewTimeline(),
+		metricList:  container.NewVBox(), values: container.NewVBox(), chartHost: container.NewVBox(),
+		timelines: make(map[telemetry.Unit]*components.Timeline),
 	}
 	page.search = widget.NewEntry()
 	page.search.SetPlaceHolder("Search metrics")
@@ -61,7 +64,8 @@ func NewMonitor(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) 
 	page.pause = widget.NewButton("Pause", page.togglePause)
 	controls := container.NewGridWithColumns(3, page.search, page.interval, page.pause)
 	left := container.NewBorder(widget.NewLabelWithStyle("Metrics", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), nil, nil, nil, container.NewVScroll(page.metricList))
-	center := container.NewBorder(controls, container.NewVScroll(page.values), nil, nil, page.timeline.Object())
+	valueRail := container.NewGridWrap(fyne.NewSize(300, 520), container.NewPadded(container.NewVScroll(page.values)))
+	center := container.NewBorder(controls, nil, nil, valueRail, container.NewVScroll(page.chartHost))
 	page.root = container.NewPadded(container.NewBorder(
 		container.NewVBox(widget.NewLabelWithStyle("Live Monitor", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), widget.NewLabel("Only selected metrics are sampled")),
 		nil, container.NewGridWrap(fyne.NewSize(280, 520), left), nil, center,
@@ -163,8 +167,7 @@ func (p *Monitor) applySelection() {
 func (p *Monitor) render(state viewmodel.MonitorState) {
 	now := time.Now()
 	valueObjects := make([]fyne.CanvasObject, 0, len(state.Selected))
-	series := make([]components.Series, 0, len(state.Selected))
-	for index, metricID := range state.Selected {
+	for _, metricID := range state.Selected {
 		descriptor := p.descriptors[metricID]
 		value := "— Loading"
 		if sample, exists := state.Current[metricID]; exists {
@@ -182,14 +185,80 @@ func (p *Monitor) render(state viewmodel.MonitorState) {
 			}
 		}
 		valueObjects = append(valueObjects, container.NewBorder(nil, nil, widget.NewLabel(descriptor.Label), nil, widget.NewLabel(value)))
-		series = append(series, components.Series{
-			ID: metricID, Label: descriptor.Label, Unit: descriptor.Unit,
-			Color: chartColors[index%len(chartColors)], Points: state.History[metricID],
-		})
 	}
 	p.values.Objects = valueObjects
 	p.values.Refresh()
-	p.timeline.SetSeries(series)
+	groups := groupSeriesByUnit(state.Selected, p.descriptors, state.History)
+	key := seriesGroupKey(groups)
+	if key != p.chartKey {
+		p.chartKey = key
+		p.timelines = make(map[telemetry.Unit]*components.Timeline, len(groups))
+		objects := make([]fyne.CanvasObject, 0, len(groups))
+		for _, group := range groups {
+			timeline := components.NewTimeline()
+			p.timelines[group.Unit] = timeline
+			objects = append(objects, widget.NewCard(unitChartTitle(group.Unit), "", timeline.Object()))
+		}
+		p.chartHost.Objects = objects
+		p.chartHost.Refresh()
+	}
+	for _, group := range groups {
+		p.timelines[group.Unit].SetSeries(group.Series)
+	}
+}
+
+type seriesGroup struct {
+	Unit   telemetry.Unit
+	Series []components.Series
+}
+
+func groupSeriesByUnit(selected []telemetry.MetricID, descriptors map[telemetry.MetricID]telemetry.Descriptor, histories map[telemetry.MetricID][]telemetry.Sample) []seriesGroup {
+	byUnit := make(map[telemetry.Unit][]components.Series)
+	var units []telemetry.Unit
+	for index, metricID := range selected {
+		descriptor := descriptors[metricID]
+		if _, exists := byUnit[descriptor.Unit]; !exists {
+			units = append(units, descriptor.Unit)
+		}
+		byUnit[descriptor.Unit] = append(byUnit[descriptor.Unit], components.Series{
+			ID: metricID, Label: descriptor.Label, Unit: descriptor.Unit,
+			Color: chartColors[index%len(chartColors)], Points: histories[metricID],
+		})
+	}
+	sort.Slice(units, func(i, j int) bool { return units[i] < units[j] })
+	groups := make([]seriesGroup, 0, len(units))
+	for _, unit := range units {
+		groups = append(groups, seriesGroup{Unit: unit, Series: byUnit[unit]})
+	}
+	return groups
+}
+
+func seriesGroupKey(groups []seriesGroup) string {
+	var builder strings.Builder
+	for _, group := range groups {
+		builder.WriteString(string(group.Unit))
+		for _, series := range group.Series {
+			builder.WriteByte('|')
+			builder.WriteString(string(series.ID))
+		}
+		builder.WriteByte(';')
+	}
+	return builder.String()
+}
+
+func unitChartTitle(unit telemetry.Unit) string {
+	switch unit {
+	case "%":
+		return "Utilization (%)"
+	case "°C":
+		return "Temperatures (°C)"
+	case "MHz":
+		return "Frequencies (MHz)"
+	case "RPM":
+		return "Fan Speed (RPM)"
+	default:
+		return "Metrics (" + string(unit) + ")"
+	}
 }
 
 func intervalLabel(interval time.Duration) string {

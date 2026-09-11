@@ -13,6 +13,7 @@ func TestOverviewUsesOnlyAvailableSummaryMetrics(t *testing.T) {
 		{ID: "cpu.utilization", Label: "CPU Utilization", Unit: "%"},
 		{ID: "hwmon.coretemp.package.temperature", Label: "Package", Unit: "°C"},
 		{ID: "cpu.0.frequency", Label: "CPU 0 Frequency", Unit: "MHz"},
+		{ID: "cpu.1.frequency", Label: "CPU 1 Frequency", Unit: "MHz"},
 		{ID: "hwmon.nct.fan1.fan", Label: "Fan 1", Unit: "RPM"},
 		{ID: "gpu.temperature", Label: "GPU Temperature", Unit: "°C"},
 	}}
@@ -28,7 +29,7 @@ func TestOverviewUsesOnlyAvailableSummaryMetrics(t *testing.T) {
 		"cpu.utilization",
 		"hwmon.coretemp.package.temperature",
 		"cpu.0.frequency",
-		"hwmon.nct.fan1.fan",
+		"cpu.1.frequency",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("metric IDs = %v", got)

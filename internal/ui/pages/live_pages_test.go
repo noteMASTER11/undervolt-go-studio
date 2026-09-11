@@ -88,3 +88,40 @@ func TestRecentSamplesKeepsOnlySixtySecondWindow(t *testing.T) {
 		t.Fatalf("recent samples = %+v", got)
 	}
 }
+
+func TestAverageSamplesCombinesPerCoreFrequency(t *testing.T) {
+	metrics := []telemetry.MetricID{"cpu.0.frequency", "cpu.1.frequency"}
+	current := map[telemetry.MetricID]telemetry.Sample{
+		"cpu.0.frequency": {MetricID: "cpu.0.frequency", Value: 2000, Quality: telemetry.QualityGood},
+		"cpu.1.frequency": {MetricID: "cpu.1.frequency", Value: 3000, Quality: telemetry.QualityGood},
+	}
+	got, ok := averageSample(current, metrics)
+	if !ok || got.Value != 2500 || got.Quality != telemetry.QualityGood {
+		t.Fatalf("average = %+v, ok=%v", got, ok)
+	}
+}
+
+func TestAppendAverageFrequencyKeepsAlignedFrameAverage(t *testing.T) {
+	page := &Overview{metrics: overviewMetrics{frequencies: []telemetry.MetricID{"cpu.0.frequency", "cpu.1.frequency"}}}
+	timestamp := time.Unix(20, 0)
+	state := viewmodel.MonitorState{Current: map[telemetry.MetricID]telemetry.Sample{
+		"cpu.0.frequency": {Value: 2000, Timestamp: timestamp, Quality: telemetry.QualityGood},
+		"cpu.1.frequency": {Value: 4000, Timestamp: timestamp, Quality: telemetry.QualityGood},
+	}}
+	page.appendAverageFrequency(state)
+	page.appendAverageFrequency(state)
+	if len(page.frequencyHistory) != 1 || page.frequencyHistory[0].Value != 3000 || !page.frequencyHistory[0].Timestamp.Equal(timestamp) {
+		t.Fatalf("frequency history = %+v", page.frequencyHistory)
+	}
+}
+
+func TestMonitorSeriesAreGroupedByUnit(t *testing.T) {
+	descriptors := map[telemetry.MetricID]telemetry.Descriptor{
+		"load": {ID: "load", Label: "Load", Unit: "%"},
+		"freq": {ID: "freq", Label: "Frequency", Unit: "MHz"},
+	}
+	groups := groupSeriesByUnit([]telemetry.MetricID{"load", "freq"}, descriptors, map[telemetry.MetricID][]telemetry.Sample{})
+	if len(groups) != 2 || groups[0].Unit == groups[1].Unit {
+		t.Fatalf("groups = %+v", groups)
+	}
+}

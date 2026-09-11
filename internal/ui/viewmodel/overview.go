@@ -27,7 +27,8 @@ func (o *Overview) SetCatalog(catalog telemetry.Catalog) {
 }
 
 func summaryMetricIDs(catalog telemetry.Catalog) []telemetry.MetricID {
-	var utilization, temperature, frequency, fan telemetry.MetricID
+	var utilization, temperature telemetry.MetricID
+	var frequencies []telemetry.MetricID
 	for _, descriptor := range catalog.Metrics {
 		id := strings.ToLower(string(descriptor.ID))
 		label := strings.ToLower(descriptor.Label)
@@ -36,17 +37,16 @@ func summaryMetricIDs(catalog telemetry.Catalog) []telemetry.MetricID {
 			utilization = descriptor.ID
 		case temperature == "" && descriptor.Unit == "°C" && (strings.Contains(label, "package") || strings.Contains(id, "package")):
 			temperature = descriptor.ID
-		case frequency == "" && descriptor.Unit == "MHz":
-			frequency = descriptor.ID
-		case fan == "" && descriptor.Unit == "RPM":
-			fan = descriptor.ID
+		case descriptor.Unit == "MHz" && strings.Contains(id, "cpu"):
+			frequencies = append(frequencies, descriptor.ID)
 		}
 	}
-	result := make([]telemetry.MetricID, 0, 4)
-	for _, metricID := range []telemetry.MetricID{utilization, temperature, frequency, fan} {
+	result := make([]telemetry.MetricID, 0, 2+len(frequencies))
+	for _, metricID := range []telemetry.MetricID{utilization, temperature} {
 		if metricID != "" {
 			result = append(result, metricID)
 		}
 	}
+	result = append(result, frequencies...)
 	return result
 }

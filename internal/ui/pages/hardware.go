@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -34,58 +35,49 @@ type Hardware struct {
 	source  HardwareSource
 	catalog telemetry.Catalog
 
-	mu      sync.Mutex
-	active  bool
-	stop    chan struct{}
-	done    chan struct{}
-	rows    []diagnosticsRow
-	devices []string
+	mu              sync.Mutex
+	active          bool
+	stop            chan struct{}
+	done            chan struct{}
+	rows            []diagnosticsRow
+	summaryRevision uint64
+	summaryCancel   context.CancelFunc
+	summaryLoaded   bool
 
-	providerList *widget.List
-	deviceList   *widget.List
-	status       *widget.Label
-	root         fyne.CanvasObject
+	status      *widget.Label
+	summaryHost *fyne.Container
+	root        fyne.CanvasObject
 }
 
 func NewHardware(info product.Info, source HardwareSource, catalog telemetry.Catalog) *Hardware {
 	page := &Hardware{info: info, source: source, catalog: cloneCatalog(catalog)}
-	page.providerList = widget.NewList(
-		func() int { page.mu.Lock(); defer page.mu.Unlock(); return len(page.rows) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(id widget.ListItemID, object fyne.CanvasObject) {
-			page.mu.Lock()
-			defer page.mu.Unlock()
-			if id >= len(page.rows) {
-				return
-			}
-			object.(*widget.Label).SetText(formatDiagnosticsRow(page.rows[id]))
-		},
-	)
-	page.deviceList = widget.NewList(
-		func() int { page.mu.Lock(); defer page.mu.Unlock(); return len(page.devices) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(id widget.ListItemID, object fyne.CanvasObject) {
-			page.mu.Lock()
-			defer page.mu.Unlock()
-			if id < len(page.devices) {
-				object.(*widget.Label).SetText(page.devices[id])
-			}
-		},
-	)
-	page.status = widget.NewLabel("Diagnostics refresh only while this page is active")
+	page.status = widget.NewLabel("Checking telemetry sources…")
+	page.summaryHost = container.NewStack(container.NewCenter(widget.NewLabel("Loading hardware overview…")))
 	copyButton := widget.NewButton("Copy Diagnostics", page.copyDiagnostics)
 	header := container.NewBorder(nil, nil, nil, copyButton, container.NewVBox(
-		widget.NewLabelWithStyle("Hardware & Providers", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("Hardware", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabel("A concise overview of this computer"),
 		page.status,
 	))
-	body := container.NewGridWithRows(2,
-		container.NewBorder(widget.NewLabelWithStyle("Discovered devices and metrics", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), nil, nil, nil, page.deviceList),
-		container.NewBorder(widget.NewLabelWithStyle("Provider health", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), nil, nil, nil, page.providerList),
-	)
-	page.root = container.NewPadded(container.NewBorder(header, nil, nil, nil, body))
+	page.root = container.NewPadded(container.NewBorder(header, nil, nil, nil, page.summaryHost))
 	page.SetCatalog(catalog)
 	page.setDiagnostics(source.Diagnostics())
 	return page
+}
+
+func hardwareOverviewObject(overview hardwareOverview) fyne.CanvasObject {
+	body := container.NewVBox(
+		container.NewGridWithColumns(2,
+			hardwareCard("System", overview.Machine, overview.OS, overview.Kernel),
+			hardwareCard("Processor", overview.CPU, overview.CPUDetails...),
+		),
+		container.NewGridWithColumns(2,
+			hardwareCard("Graphics", firstOrFallback(overview.Graphics, "No graphics adapter detected"), remaining(overview.Graphics)...),
+			hardwareCard("Memory", overview.Memory, overview.MemoryDetails...),
+		),
+		hardwareCard("Storage", firstOrFallback(overview.Storage, "No local drives detected"), remaining(overview.Storage)...),
+	)
+	return container.NewVScroll(body)
 }
 
 func (p *Hardware) ID() string                { return "hardware" }
@@ -101,41 +93,71 @@ func (p *Hardware) Activate() {
 	p.stop = make(chan struct{})
 	p.done = make(chan struct{})
 	stop, done := p.stop, p.done
+	reload := !p.summaryLoaded && p.summaryCancel == nil
+	catalog := cloneCatalog(p.catalog)
 	p.mu.Unlock()
+	if reload {
+		p.SetCatalog(catalog)
+	}
 	go p.refreshLoop(stop, done)
 }
 
 func (p *Hardware) Deactivate() {
 	p.mu.Lock()
+	p.summaryRevision++
+	cancelSummary := p.summaryCancel
+	p.summaryCancel = nil
 	if !p.active {
 		p.mu.Unlock()
+		if cancelSummary != nil {
+			cancelSummary()
+		}
 		return
 	}
 	p.active = false
 	stop, done := p.stop, p.done
 	p.stop, p.done = nil, nil
 	p.mu.Unlock()
+	if cancelSummary != nil {
+		cancelSummary()
+	}
 	close(stop)
 	<-done
 }
 
 func (p *Hardware) SetCatalog(catalog telemetry.Catalog) {
-	devices := make([]string, 0, len(catalog.Devices)+len(catalog.Metrics))
-	for _, device := range catalog.Devices {
-		devices = append(devices, fmt.Sprintf("%s · %s · %s", device.Kind, device.Vendor, device.Name))
-		for _, descriptor := range catalog.Metrics {
-			if descriptor.DeviceID == device.ID {
-				devices = append(devices, fmt.Sprintf("    %s [%s] · %s", descriptor.Label, descriptor.Unit, descriptor.ProviderID))
-			}
-		}
-	}
 	p.mu.Lock()
+	previousCancel := p.summaryCancel
 	p.catalog = cloneCatalog(catalog)
-	p.devices = devices
+	p.summaryRevision++
+	revision := p.summaryRevision
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	p.summaryCancel = cancel
+	p.summaryLoaded = false
 	p.mu.Unlock()
-	if p.deviceList != nil {
-		p.deviceList.Refresh()
+	if previousCancel != nil {
+		previousCancel()
 	}
+	p.summaryHost.Objects = []fyne.CanvasObject{container.NewCenter(widget.NewLabel("Loading hardware overview…"))}
+	p.summaryHost.Refresh()
+	go func() {
+		defer cancel()
+		overview := readHardwareOverview(ctx, catalog)
+		fyne.Do(func() {
+			p.mu.Lock()
+			current := p.summaryRevision == revision
+			if current {
+				p.summaryCancel = nil
+				p.summaryLoaded = true
+			}
+			p.mu.Unlock()
+			if !current {
+				return
+			}
+			p.summaryHost.Objects = []fyne.CanvasObject{hardwareOverviewObject(overview)}
+			p.summaryHost.Refresh()
+		})
+	}()
 }
 
 func (p *Hardware) refreshLoop(stop <-chan struct{}, done chan<- struct{}) {
@@ -161,8 +183,51 @@ func (p *Hardware) applyRows(rows []diagnosticsRow) {
 	p.mu.Lock()
 	p.rows = append([]diagnosticsRow(nil), rows...)
 	p.mu.Unlock()
-	p.providerList.Refresh()
-	p.status.SetText(fmt.Sprintf("%d providers · refreshes every second while active", len(rows)))
+	healthy := 0
+	for _, row := range rows {
+		if row.Error == "" {
+			healthy++
+		}
+	}
+	if len(rows) == 0 {
+		p.status.SetText("Telemetry sources will appear when monitoring starts")
+		return
+	}
+	if healthy == len(rows) {
+		p.status.SetText(fmt.Sprintf("Telemetry ready · %d sources available", healthy))
+		return
+	}
+	p.status.SetText(fmt.Sprintf("Telemetry limited · %d of %d sources available", healthy, len(rows)))
+}
+
+func hardwareCard(title, primary string, details ...string) fyne.CanvasObject {
+	content := container.NewVBox()
+	primaryLabel := widget.NewLabelWithStyle(primary, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	primaryLabel.Wrapping = fyne.TextWrapWord
+	content.Add(primaryLabel)
+	for _, detail := range details {
+		if detail == "" {
+			continue
+		}
+		label := widget.NewLabel(detail)
+		label.Wrapping = fyne.TextWrapWord
+		content.Add(label)
+	}
+	return widget.NewCard(title, "", content)
+}
+
+func firstOrFallback(values []string, fallback string) string {
+	if len(values) == 0 {
+		return fallback
+	}
+	return values[0]
+}
+
+func remaining(values []string) []string {
+	if len(values) < 2 {
+		return nil
+	}
+	return values[1:]
 }
 
 func (p *Hardware) copyDiagnostics() {

@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,33 @@ func TestHardwareRowsExposeProviderHealth(t *testing.T) {
 	}
 	if rows[0].Provider != "linux.hwmon" || rows[0].State != "backoff" || rows[0].Dropped != 2 {
 		t.Fatalf("row = %+v", rows[0])
+	}
+}
+
+func TestHardwareSummaryParsersReturnHumanReadableValues(t *testing.T) {
+	osValues := parseKeyValues("NAME=CachyOS\nPRETTY_NAME=\"CachyOS Linux\"\n")
+	if osValues["PRETTY_NAME"] != "CachyOS Linux" {
+		t.Fatalf("PRETTY_NAME = %q", osValues["PRETTY_NAME"])
+	}
+	if total := parseKilobytes("32768000 kB"); total != 32768000*1024 {
+		t.Fatalf("memory bytes = %d", total)
+	}
+	if got := humanBytes(2 * 1024 * 1024 * 1024 * 1024); got != "2.0 TiB" {
+		t.Fatalf("drive size = %q", got)
+	}
+}
+
+func TestParseLSPCIKeepsOnlyGraphicsAdapters(t *testing.T) {
+	input := `00:02.0 "VGA compatible controller" "Intel Corporation" "Arrow Lake-S [Intel Graphics]" -r02
+02:00.0 "3D controller" "NVIDIA Corporation" "GeForce RTX 5080 Laptop GPU" -r01
+80:14.5 "Non-VGA unclassified device" "Intel Corporation" "Device 7f2f" -r10
+80:14.3 "Network controller" "Intel Corporation" "Wi-Fi Adapter" -r00`
+	want := []string{
+		"Intel Arrow Lake-S [Intel Graphics]",
+		"NVIDIA GeForce RTX 5080 Laptop GPU",
+	}
+	if got := parseLSPCI(input); !reflect.DeepEqual(got, want) {
+		t.Fatalf("graphics = %#v, want %#v", got, want)
 	}
 }
 

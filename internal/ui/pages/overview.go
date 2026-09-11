@@ -20,32 +20,41 @@ var chartColors = []color.Color{
 	color.NRGBA{R: 250, G: 204, B: 21, A: 255},
 }
 
+type overviewMetrics struct {
+	utilization telemetry.MetricID
+	temperature telemetry.MetricID
+	frequencies []telemetry.MetricID
+}
+
 type Overview struct {
-	vm          *viewmodel.Overview
-	catalog     telemetry.Catalog
-	descriptors map[telemetry.MetricID]telemetry.Descriptor
-	cards       map[telemetry.MetricID]*components.MetricCard
-	cardGrid    *fyne.Container
-	timeline    *components.Timeline
-	updates     *components.LatestDispatcher[viewmodel.MonitorState]
-	root        fyne.CanvasObject
+	vm               *viewmodel.Overview
+	catalog          telemetry.Catalog
+	descriptors      map[telemetry.MetricID]telemetry.Descriptor
+	metrics          overviewMetrics
+	cards            map[string]*components.MetricCard
+	cardGrid         *fyne.Container
+	charts           map[string]*components.Timeline
+	chartHost        *fyne.Container
+	updates          *components.LatestDispatcher[viewmodel.MonitorState]
+	frequencyHistory []telemetry.Sample
+	root             fyne.CanvasObject
 }
 
 func NewOverview(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) *Overview {
 	page := &Overview{
 		vm:          viewmodel.NewOverview(source, catalog, 250*time.Millisecond),
 		descriptors: make(map[telemetry.MetricID]telemetry.Descriptor),
-		cards:       make(map[telemetry.MetricID]*components.MetricCard),
-		cardGrid:    container.NewGridWithColumns(4),
-		timeline:    components.NewTimeline(),
+		cards:       make(map[string]*components.MetricCard),
+		cardGrid:    container.NewGridWithColumns(3),
+		charts:      make(map[string]*components.Timeline),
+		chartHost:   container.NewStack(),
 	}
 	page.root = container.NewPadded(container.NewBorder(
 		container.NewVBox(
 			widget.NewLabelWithStyle("System Overview", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-			widget.NewLabel("Live summary · 60-second rolling history"),
+			widget.NewLabel("Live CPU telemetry · independent scales · 60-second window"),
 			page.cardGrid,
-		), nil, nil, nil,
-		container.NewPadded(page.timeline.Object()),
+		), nil, nil, nil, page.chartHost,
 	))
 	page.updates = components.NewLatestDispatcher(fyne.Do, page.render)
 	page.vm.SetListener(page.updates.Submit)
@@ -62,41 +71,155 @@ func (p *Overview) SetCatalog(catalog telemetry.Catalog) {
 	p.catalog = cloneCatalog(catalog)
 	p.descriptors = descriptorMap(catalog)
 	p.vm.SetCatalog(catalog)
-	p.rebuildCards(p.vm.State())
+	p.metrics = classifyOverviewMetrics(p.vm.State().Selected, p.descriptors)
+	p.frequencyHistory = nil
+	p.rebuild(p.vm.State())
 }
 
-func (p *Overview) rebuildCards(state viewmodel.MonitorState) {
-	p.cards = make(map[telemetry.MetricID]*components.MetricCard, len(state.Selected))
-	objects := make([]fyne.CanvasObject, 0, 4)
-	for _, metricID := range state.Selected {
-		descriptor := p.descriptors[metricID]
-		card := components.NewMetricCard(descriptor.Label, descriptor.Unit)
-		p.cards[metricID] = card
-		objects = append(objects, card.Object())
+func (p *Overview) rebuild(state viewmodel.MonitorState) {
+	p.cards = make(map[string]*components.MetricCard, 3)
+	cardObjects := make([]fyne.CanvasObject, 0, 3)
+	addCard := func(key, label string, unit telemetry.Unit) {
+		card := components.NewMetricCard(label, unit)
+		p.cards[key] = card
+		cardObjects = append(cardObjects, card.Object())
 	}
-	for len(objects) < 4 {
-		labels := []string{"CPU utilization", "CPU temperature", "Effective frequency", "Fan speed"}
-		objects = append(objects, components.NewMetricCard(labels[len(objects)], "").Object())
+	if p.metrics.utilization != "" {
+		addCard("utilization", "CPU Load", "%")
 	}
-	p.cardGrid.Objects = objects
+	if p.metrics.temperature != "" {
+		addCard("temperature", "Package Temperature", "°C")
+	}
+	if len(p.metrics.frequencies) > 0 {
+		addCard("frequency", "Average CPU Frequency", "MHz")
+	}
+	p.cardGrid.Objects = cardObjects
 	p.cardGrid.Refresh()
+
+	p.charts = make(map[string]*components.Timeline, 3)
+	chartObjects := make([]fyne.CanvasObject, 0, 3)
+	addChart := func(key, title string) {
+		timeline := components.NewTimeline()
+		p.charts[key] = timeline
+		chartObjects = append(chartObjects, widget.NewCard(title, "", timeline.Object()))
+	}
+	if p.metrics.utilization != "" {
+		addChart("utilization", "CPU Load")
+	}
+	if p.metrics.temperature != "" {
+		addChart("temperature", "Package Temperature")
+	}
+	if len(p.metrics.frequencies) > 0 {
+		addChart("frequency", "Average CPU Frequency")
+	}
+	p.chartHost.Objects = []fyne.CanvasObject{overviewChartLayout(chartObjects)}
+	p.chartHost.Refresh()
 	p.render(state)
 }
 
 func (p *Overview) render(state viewmodel.MonitorState) {
 	now := time.Now()
-	series := make([]components.Series, 0, len(state.Selected))
-	for index, metricID := range state.Selected {
-		descriptor := p.descriptors[metricID]
-		if sample, exists := state.Current[metricID]; exists {
-			p.cards[metricID].SetSample(sample, sample.QualityAt(now, state.Interval*3))
-		}
-		series = append(series, components.Series{
-			ID: metricID, Label: descriptor.Label, Unit: descriptor.Unit,
-			Color: chartColors[index%len(chartColors)], Points: recentSamples(state.History[metricID], now.Add(-60*time.Second)),
-		})
+	cutoff := now.Add(-60 * time.Second)
+	if metricID := p.metrics.utilization; metricID != "" {
+		p.renderDirect("utilization", metricID, state, now, cutoff, chartColors[0])
 	}
-	p.timeline.SetSeries(series)
+	if metricID := p.metrics.temperature; metricID != "" {
+		p.renderDirect("temperature", metricID, state, now, cutoff, chartColors[1])
+	}
+	if len(p.metrics.frequencies) > 0 {
+		if sample, ok := averageSample(state.Current, p.metrics.frequencies); ok {
+			p.cards["frequency"].SetSample(sample, sample.QualityAt(now, state.Interval*3))
+		}
+		p.appendAverageFrequency(state)
+		p.charts["frequency"].SetSeries([]components.Series{{
+			ID: "cpu.average.frequency", Label: "Average", Unit: "MHz", Color: chartColors[2],
+			Points: recentSamples(p.frequencyHistory, cutoff),
+		}})
+	}
+}
+
+func (p *Overview) appendAverageFrequency(state viewmodel.MonitorState) {
+	sample, ok := averageSample(state.Current, p.metrics.frequencies)
+	if !ok || sample.Timestamp.IsZero() {
+		return
+	}
+	if count := len(p.frequencyHistory); count > 0 && !sample.Timestamp.After(p.frequencyHistory[count-1].Timestamp) {
+		return
+	}
+	p.frequencyHistory = append(p.frequencyHistory, sample)
+	const capacity = 600
+	if len(p.frequencyHistory) > capacity {
+		p.frequencyHistory = append([]telemetry.Sample(nil), p.frequencyHistory[len(p.frequencyHistory)-capacity:]...)
+	}
+}
+
+func (p *Overview) renderDirect(key string, metricID telemetry.MetricID, state viewmodel.MonitorState, now, cutoff time.Time, lineColor color.Color) {
+	descriptor := p.descriptors[metricID]
+	if sample, exists := state.Current[metricID]; exists {
+		p.cards[key].SetSample(sample, sample.QualityAt(now, state.Interval*3))
+	}
+	p.charts[key].SetSeries([]components.Series{{
+		ID: metricID, Label: descriptor.Label, Unit: descriptor.Unit, Color: lineColor,
+		Points: recentSamples(state.History[metricID], cutoff),
+	}})
+}
+
+func classifyOverviewMetrics(selected []telemetry.MetricID, descriptors map[telemetry.MetricID]telemetry.Descriptor) overviewMetrics {
+	var result overviewMetrics
+	for _, metricID := range selected {
+		descriptor := descriptors[metricID]
+		switch descriptor.Unit {
+		case "%":
+			if result.utilization == "" {
+				result.utilization = metricID
+			}
+		case "°C":
+			if result.temperature == "" {
+				result.temperature = metricID
+			}
+		case "MHz":
+			result.frequencies = append(result.frequencies, metricID)
+		}
+	}
+	return result
+}
+
+func overviewChartLayout(charts []fyne.CanvasObject) fyne.CanvasObject {
+	switch len(charts) {
+	case 0:
+		return container.NewCenter(widget.NewLabel("Waiting for hardware discovery…"))
+	case 1:
+		return charts[0]
+	case 2:
+		return container.NewGridWithColumns(2, charts...)
+	default:
+		return container.NewGridWithRows(2, container.NewGridWithColumns(2, charts[0], charts[1]), charts[2])
+	}
+}
+
+func averageSample(samples map[telemetry.MetricID]telemetry.Sample, metricIDs []telemetry.MetricID) (telemetry.Sample, bool) {
+	var total float64
+	var count int
+	var timestamp time.Time
+	quality := telemetry.QualityGood
+	for _, metricID := range metricIDs {
+		sample, exists := samples[metricID]
+		if !exists || sample.Quality == telemetry.QualityUnavailable {
+			continue
+		}
+		total += sample.Value
+		count++
+		if sample.Timestamp.After(timestamp) {
+			timestamp = sample.Timestamp
+		}
+		if sample.Quality == telemetry.QualityStale {
+			quality = telemetry.QualityStale
+		}
+	}
+	if count == 0 {
+		return telemetry.Sample{}, false
+	}
+	return telemetry.Sample{MetricID: "cpu.average.frequency", Value: total / float64(count), Timestamp: timestamp, Quality: quality}, true
 }
 
 func recentSamples(samples []telemetry.Sample, cutoff time.Time) []telemetry.Sample {

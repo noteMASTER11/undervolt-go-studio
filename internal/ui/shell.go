@@ -3,7 +3,6 @@ package ui
 import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -49,7 +48,7 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 			_ = shell.Select(id)
 		})
 		button.Alignment = widget.ButtonAlignLeading
-		navigation.Add(container.NewGridWrap(fyne.NewSize(190, 42), button))
+		navigation.Add(container.NewGridWrap(fyne.NewSize(180, 42), button))
 	}
 	left := container.NewBorder(
 		container.NewPadded(widget.NewLabelWithStyle("WORKSPACE", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})),
@@ -62,27 +61,13 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 	shell.revertButton = widget.NewButton("Revert", nil)
 	shell.applyButton.Disable()
 	shell.revertButton.Disable()
-	right := container.NewGridWrap(fyne.NewSize(270, 520), container.NewPadded(container.NewVBox(
-		widget.NewLabelWithStyle("QUICK TUNING", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabel("Current profile"),
-		widget.NewLabelWithStyle("Stock", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		widget.NewSeparator(),
-		widget.NewLabel("PL1"),
-		widget.NewLabel("— unavailable"),
-		widget.NewLabel("PL2"),
-		widget.NewLabel("— unavailable"),
-		layout.NewSpacer(),
-		shell.statusLabel,
-		container.NewGridWithColumns(2, shell.revertButton, shell.applyButton),
-	)))
 
 	header := container.NewPadded(container.NewBorder(
 		nil, nil, nil,
-		widget.NewLabel(info.Version),
+		container.NewHBox(shell.statusLabel, widget.NewSeparator(), widget.NewLabel(info.Version)),
 		widget.NewLabelWithStyle(info.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 	))
-	shell.root = container.NewBorder(header, nil, left, right, shell.center)
+	shell.root = container.NewBorder(header, nil, left, nil, shell.center)
 	_ = shell.Select("overview")
 	return shell
 }
