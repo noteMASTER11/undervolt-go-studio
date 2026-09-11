@@ -2,7 +2,7 @@
 
 Date: 2026-09-11
 
-Status: Approved in conversation; awaiting written-spec review
+Status: Approved; Intel tuning details refined by `2026-09-11-intel-tuning-backend-design.md`
 
 Working repository name: `undervolt-go-studio`
 

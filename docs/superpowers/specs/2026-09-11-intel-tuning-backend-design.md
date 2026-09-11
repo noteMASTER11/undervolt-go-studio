@@ -2,7 +2,7 @@
 
 Date: 2026-09-11
 
-Status: Approved in conversation; awaiting written-spec review
+Status: Approved after written-spec review on 2026-09-11
 
 Supersedes the privileged-helper transport and Intel-tuning details in `2026-09-11-undervolt-go-studio-design.md`. The general product specification remains authoritative for the rest of the application.
 
