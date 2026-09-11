@@ -50,3 +50,13 @@ func TestProcStatMarksCounterRegressionUnavailable(t *testing.T) {
 		t.Fatalf("sample = %+v", frame.Samples[0])
 	}
 }
+
+func TestParseProcStatDoesNotDoubleCountGuestTime(t *testing.T) {
+	counters, err := parseProcStat([]byte("cpu 100 20 30 40 5 6 7 8 90 10\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counters["cpu"].total; got != 216 {
+		t.Fatalf("total = %d, want 216", got)
+	}
+}

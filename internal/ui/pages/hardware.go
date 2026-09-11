@@ -58,11 +58,7 @@ func NewHardware(info product.Info, source HardwareSource, catalog telemetry.Cat
 			if id >= len(page.rows) {
 				return
 			}
-			row := page.rows[id]
-			object.(*widget.Label).SetText(fmt.Sprintf(
-				"%s  |  %s  |  latency %s  |  metrics %d  |  consumers %d  |  dropped %d  |  %s",
-				row.Provider, row.State, row.Latency, row.Metrics, row.Consumers, row.Dropped, row.Error,
-			))
+			object.(*widget.Label).SetText(formatDiagnosticsRow(page.rows[id]))
 		},
 	)
 	page.deviceList = widget.NewList(
@@ -201,6 +197,13 @@ func diagnosticsRows(diagnostics []telemetry.ProviderDiagnostics) []diagnosticsR
 		}
 	}
 	return rows
+}
+
+func formatDiagnosticsRow(row diagnosticsRow) string {
+	return fmt.Sprintf(
+		"%s  |  %s  |  success %s  |  latency %s  |  metrics %d  |  consumers %d  |  dropped %d  |  %s",
+		row.Provider, row.State, row.Success, row.Latency, row.Metrics, row.Consumers, row.Dropped, row.Error,
+	)
 }
 
 func diagnosticsJSON(info product.Info, catalog telemetry.Catalog, diagnostics []telemetry.ProviderDiagnostics) ([]byte, error) {

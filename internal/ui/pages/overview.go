@@ -27,6 +27,7 @@ type Overview struct {
 	cards       map[telemetry.MetricID]*components.MetricCard
 	cardGrid    *fyne.Container
 	timeline    *components.Timeline
+	updates     *components.LatestDispatcher[viewmodel.MonitorState]
 	root        fyne.CanvasObject
 }
 
@@ -46,9 +47,8 @@ func NewOverview(source viewmodel.SubscriptionSource, catalog telemetry.Catalog)
 		), nil, nil, nil,
 		container.NewPadded(page.timeline.Object()),
 	))
-	page.vm.SetListener(func(state viewmodel.MonitorState) {
-		fyne.Do(func() { page.render(state) })
-	})
+	page.updates = components.NewLatestDispatcher(fyne.Do, page.render)
+	page.vm.SetListener(page.updates.Submit)
 	page.SetCatalog(catalog)
 	return page
 }
@@ -93,8 +93,16 @@ func (p *Overview) render(state viewmodel.MonitorState) {
 		}
 		series = append(series, components.Series{
 			ID: metricID, Label: descriptor.Label, Unit: descriptor.Unit,
-			Color: chartColors[index%len(chartColors)], Points: state.History[metricID],
+			Color: chartColors[index%len(chartColors)], Points: recentSamples(state.History[metricID], now.Add(-60*time.Second)),
 		})
 	}
 	p.timeline.SetSeries(series)
+}
+
+func recentSamples(samples []telemetry.Sample, cutoff time.Time) []telemetry.Sample {
+	first := 0
+	for first < len(samples) && samples[first].Timestamp.Before(cutoff) {
+		first++
+	}
+	return append([]telemetry.Sample(nil), samples[first:]...)
 }

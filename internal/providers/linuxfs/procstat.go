@@ -38,7 +38,10 @@ func (p *ProcStat) ID() string {
 	return "linux.procstat"
 }
 
-func (p *ProcStat) Discover(context.Context) (telemetry.Catalog, error) {
+func (p *ProcStat) Discover(ctx context.Context) (telemetry.Catalog, error) {
+	if err := ctx.Err(); err != nil {
+		return telemetry.Catalog{}, err
+	}
 	data, err := p.filesystem.ReadFile("proc/stat")
 	if err != nil {
 		return telemetry.Catalog{}, err
@@ -157,7 +160,12 @@ func parseProcStat(data []byte) (map[string]cpuCounters, error) {
 			values = append(values, value)
 		}
 		var total uint64
-		for _, value := range values {
+		accounted := len(values)
+		if accounted > 8 {
+			// guest and guest_nice are already included in user and nice.
+			accounted = 8
+		}
+		for _, value := range values[:accounted] {
 			total += value
 		}
 		idle := values[3]

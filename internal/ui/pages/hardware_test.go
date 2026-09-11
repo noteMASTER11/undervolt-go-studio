@@ -25,6 +25,13 @@ func TestHardwareRowsExposeProviderHealth(t *testing.T) {
 	}
 }
 
+func TestHardwareRowRendersLastSuccess(t *testing.T) {
+	rows := diagnosticsRows([]telemetry.ProviderDiagnostics{{ProviderID: "linux.hwmon", LastSuccess: time.Unix(1, 0).UTC()}})
+	if got := formatDiagnosticsRow(rows[0]); !strings.Contains(got, "1970-01-01T00:00:01Z") {
+		t.Fatalf("rendered row omits last success: %q", got)
+	}
+}
+
 type diagnosticsSource struct{}
 
 func (diagnosticsSource) Diagnostics() []telemetry.ProviderDiagnostics { return nil }

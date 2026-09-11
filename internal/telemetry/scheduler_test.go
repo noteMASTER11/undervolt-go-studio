@@ -2,6 +2,8 @@ package telemetry_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,6 +132,126 @@ func TestProviderFailurePublishesUnavailableSamples(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("provider failure was not published")
+	}
+}
+
+type discoveryProvider struct {
+	id    string
+	delay time.Duration
+}
+
+func (p discoveryProvider) ID() string { return p.id }
+func (p discoveryProvider) Discover(ctx context.Context) (telemetry.Catalog, error) {
+	select {
+	case <-time.After(p.delay):
+		return telemetry.Catalog{Metrics: []telemetry.Descriptor{{ID: telemetry.MetricID(p.id + ".metric"), ProviderID: p.id}}}, nil
+	case <-ctx.Done():
+		return telemetry.Catalog{}, ctx.Err()
+	}
+}
+func (p discoveryProvider) Sample(context.Context, []telemetry.MetricID) (telemetry.Frame, error) {
+	return telemetry.Frame{}, fmt.Errorf("not implemented")
+}
+
+func TestDiscoveryRunsProvidersConcurrentlyWithDeadlines(t *testing.T) {
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{
+		discoveryProvider{id: "slow", delay: 100 * time.Millisecond},
+		discoveryProvider{id: "fast"},
+	}, telemetry.SchedulerOptions{ProviderTimeout: 20 * time.Millisecond})
+	started := time.Now()
+	catalog, err := scheduler.Discover(context.Background())
+	if err == nil {
+		t.Fatal("slow discovery did not report its deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 70*time.Millisecond {
+		t.Fatalf("discovery took %s; providers ran serially or without deadline", elapsed)
+	}
+	if len(catalog.Metrics) != 1 || catalog.Metrics[0].ID != "fast.metric" {
+		t.Fatalf("catalog = %+v", catalog)
+	}
+}
+
+type cadenceProvider struct {
+	mu      sync.Mutex
+	metrics []telemetry.Descriptor
+	counts  map[telemetry.MetricID]int
+}
+
+func (p *cadenceProvider) ID() string { return "cadence" }
+func (p *cadenceProvider) Discover(context.Context) (telemetry.Catalog, error) {
+	return telemetry.Catalog{Metrics: append([]telemetry.Descriptor(nil), p.metrics...)}, nil
+}
+func (p *cadenceProvider) Sample(_ context.Context, metricIDs []telemetry.MetricID) (telemetry.Frame, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	frame := telemetry.Frame{ProviderID: p.ID(), StartedAt: now, FinishedAt: now}
+	for _, metricID := range metricIDs {
+		p.counts[metricID]++
+		frame.Samples = append(frame.Samples, telemetry.Sample{MetricID: metricID, Value: 1, Timestamp: now, Quality: telemetry.QualityGood})
+	}
+	return frame, nil
+}
+func (p *cadenceProvider) count(metricID telemetry.MetricID) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.counts[metricID]
+}
+
+func TestSchedulerHonorsPerMetricMinimumIntervals(t *testing.T) {
+	provider := &cadenceProvider{counts: make(map[telemetry.MetricID]int), metrics: []telemetry.Descriptor{
+		{ID: "fast", ProviderID: "cadence", MinInterval: time.Millisecond},
+		{ID: "slow", ProviderID: "cadence", MinInterval: 40 * time.Millisecond},
+	}}
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, telemetry.SchedulerOptions{MinInterval: time.Millisecond, MaxInterval: time.Second, AllowTestIntervals: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := scheduler.Discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.Start(ctx)
+	handle := scheduler.Subscribe(telemetry.Subscription{ConsumerID: "monitor", MetricIDs: []telemetry.MetricID{"fast", "slow"}, Interval: time.Millisecond})
+	time.Sleep(20 * time.Millisecond)
+	handle.Close()
+	if fast := provider.count("fast"); fast < 3 {
+		t.Fatalf("fast samples = %d", fast)
+	}
+	if slow := provider.count("slow"); slow != 1 {
+		t.Fatalf("slow samples = %d, want 1", slow)
+	}
+}
+
+func TestSchedulerHonorsEachSubscriberDeliveryInterval(t *testing.T) {
+	provider := &cadenceProvider{counts: make(map[telemetry.MetricID]int), metrics: []telemetry.Descriptor{{ID: "metric", ProviderID: "cadence", MinInterval: time.Millisecond}}}
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, telemetry.SchedulerOptions{MinInterval: time.Millisecond, MaxInterval: time.Second, AllowTestIntervals: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := scheduler.Discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.Start(ctx)
+	fast := scheduler.Subscribe(telemetry.Subscription{ConsumerID: "fast", MetricIDs: []telemetry.MetricID{"metric"}, Interval: time.Millisecond})
+	slow := scheduler.Subscribe(telemetry.Subscription{ConsumerID: "slow", MetricIDs: []telemetry.MetricID{"metric"}, Interval: 40 * time.Millisecond})
+	defer fast.Close()
+	defer slow.Close()
+	deadline := time.After(20 * time.Millisecond)
+	fastFrames, slowFrames := 0, 0
+loop:
+	for {
+		select {
+		case <-fast.Frames():
+			fastFrames++
+		case <-slow.Frames():
+			slowFrames++
+		case <-deadline:
+			break loop
+		}
+	}
+	if fastFrames < 3 {
+		t.Fatalf("fast frames = %d", fastFrames)
+	}
+	if slowFrames != 1 {
+		t.Fatalf("slow frames = %d, want 1", slowFrames)
 	}
 }
 

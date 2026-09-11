@@ -30,6 +30,7 @@ type Monitor struct {
 	metricList *fyne.Container
 	values     *fyne.Container
 	timeline   *components.Timeline
+	updates    *components.LatestDispatcher[viewmodel.MonitorState]
 	root       fyne.CanvasObject
 }
 
@@ -65,9 +66,8 @@ func NewMonitor(source viewmodel.SubscriptionSource, catalog telemetry.Catalog) 
 		container.NewVBox(widget.NewLabelWithStyle("Live Monitor", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), widget.NewLabel("Only selected metrics are sampled")),
 		nil, container.NewGridWrap(fyne.NewSize(280, 520), left), nil, center,
 	))
-	page.vm.SetListener(func(state viewmodel.MonitorState) {
-		fyne.Do(func() { page.render(state) })
-	})
+	page.updates = components.NewLatestDispatcher(fyne.Do, page.render)
+	page.vm.SetListener(page.updates.Submit)
 	page.SetCatalog(catalog)
 	return page
 }

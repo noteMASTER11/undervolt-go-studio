@@ -30,7 +30,10 @@ func (p *CPUFreq) ID() string {
 	return "linux.cpufreq"
 }
 
-func (p *CPUFreq) Discover(context.Context) (telemetry.Catalog, error) {
+func (p *CPUFreq) Discover(ctx context.Context) (telemetry.Catalog, error) {
+	if err := ctx.Err(); err != nil {
+		return telemetry.Catalog{}, err
+	}
 	entries, err := p.filesystem.ReadDir(cpuDirectory)
 	if err != nil {
 		return telemetry.Catalog{}, err
@@ -41,6 +44,9 @@ func (p *CPUFreq) Discover(context.Context) (telemetry.Catalog, error) {
 	}
 	var cpus []discoveredCPU
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return telemetry.Catalog{}, err
+		}
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "cpu") {
 			continue
 		}

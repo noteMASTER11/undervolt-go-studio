@@ -79,3 +79,12 @@ func TestMonitorIntervalOptionsStayWithinSchedulerBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestRecentSamplesKeepsOnlySixtySecondWindow(t *testing.T) {
+	now := time.Unix(100, 0)
+	samples := []telemetry.Sample{{Timestamp: now.Add(-61 * time.Second)}, {Timestamp: now.Add(-60 * time.Second)}, {Timestamp: now}}
+	got := recentSamples(samples, now.Add(-60*time.Second))
+	if len(got) != 2 || !got[0].Timestamp.Equal(now.Add(-60*time.Second)) {
+		t.Fatalf("recent samples = %+v", got)
+	}
+}

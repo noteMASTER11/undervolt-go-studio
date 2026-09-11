@@ -133,3 +133,23 @@ func TestMonitorStateExcludesDeselectedHistory(t *testing.T) {
 		t.Fatal("deselected history was copied")
 	}
 }
+
+func TestMonitorDoesNotPlotUnavailableAsZero(t *testing.T) {
+	source := &fakeSource{}
+	vm := NewMonitor(source, 250*time.Millisecond)
+	vm.SetMetricIDs([]telemetry.MetricID{"temperature"})
+	states := make(chan MonitorState, 2)
+	vm.SetListener(func(state MonitorState) { states <- state })
+	vm.Activate()
+	defer vm.Deactivate()
+	source.handles[0].frames <- telemetry.Frame{Samples: []telemetry.Sample{{MetricID: "temperature", Value: 70, Quality: telemetry.QualityGood}}}
+	<-states
+	source.handles[0].frames <- telemetry.Frame{Samples: []telemetry.Sample{{MetricID: "temperature", Quality: telemetry.QualityUnavailable, Error: "timeout"}}}
+	state := <-states
+	if len(state.History["temperature"]) != 1 || state.History["temperature"][0].Value != 70 {
+		t.Fatalf("history = %+v", state.History["temperature"])
+	}
+	if state.Current["temperature"].Quality != telemetry.QualityUnavailable {
+		t.Fatalf("current = %+v", state.Current["temperature"])
+	}
+}

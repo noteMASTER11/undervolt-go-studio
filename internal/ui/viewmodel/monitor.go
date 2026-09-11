@@ -158,6 +158,9 @@ func (m *Monitor) consume(handle SubscriptionHandle, done chan struct{}) {
 		m.mu.Lock()
 		for _, sample := range frame.Samples {
 			m.current[sample.MetricID] = sample
+			if sample.Quality == telemetry.QualityUnavailable {
+				continue
+			}
 			ring := m.histories[sample.MetricID]
 			if ring == nil {
 				ring = history.New(historyCapacity)

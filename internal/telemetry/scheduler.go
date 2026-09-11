@@ -47,7 +47,13 @@ func (h *Handle) Close() {
 type subscriptionEntry struct {
 	subscription Subscription
 	metricSet    map[MetricID]struct{}
+	lastDelivery map[string]time.Time
 	handle       *Handle
+}
+
+type metricDemand struct {
+	id       MetricID
+	interval time.Duration
 }
 
 type providerRuntime struct {
@@ -133,14 +139,72 @@ func NewScheduler(providers []Provider, options SchedulerOptions) *Scheduler {
 
 // Discover builds the metric-to-provider routing catalog.
 func (s *Scheduler) Discover(ctx context.Context) (Catalog, error) {
+	type discoveryResult struct {
+		index   int
+		id      string
+		catalog Catalog
+		err     error
+	}
+	results := make(chan discoveryResult, len(s.providerOrder))
+	discoveryCtx, cancelDiscovery := context.WithCancel(ctx)
+	defer cancelDiscovery()
+	for index, id := range s.providerOrder {
+		runtime := s.runtimes[id]
+		go func() {
+			providerCtx, cancel := context.WithTimeout(discoveryCtx, s.options.ProviderTimeout)
+			defer cancel()
+			catalog, err := runtime.provider.Discover(providerCtx)
+			results <- discoveryResult{index: index, id: id, catalog: catalog, err: err}
+		}()
+	}
+
+	discovered := make([]discoveryResult, len(s.providerOrder))
+	seen := make([]bool, len(s.providerOrder))
+	remaining := len(s.providerOrder)
+	timer := time.NewTimer(s.options.ProviderTimeout)
+	defer timer.Stop()
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			if !seen[result.index] {
+				discovered[result.index] = result
+				seen[result.index] = true
+				remaining--
+			}
+		case <-timer.C:
+			cancelDiscovery()
+			remaining = 0
+		case <-ctx.Done():
+			cancelDiscovery()
+			remaining = 0
+		}
+	}
+	// Capture providers that completed concurrently with the deadline signal.
+	for {
+		select {
+		case result := <-results:
+			if !seen[result.index] {
+				discovered[result.index] = result
+				seen[result.index] = true
+			}
+		default:
+			goto combine
+		}
+	}
+
+combine:
 	var combined Catalog
 	metricProvider := make(map[MetricID]string)
 	descriptors := make(map[MetricID]Descriptor)
 	var discoverErrors []error
 
-	for _, id := range s.providerOrder {
+	for index, id := range s.providerOrder {
 		runtime := s.runtimes[id]
-		catalog, err := runtime.provider.Discover(ctx)
+		result := discovered[index]
+		if !seen[index] {
+			result.err = context.DeadlineExceeded
+		}
+		catalog, err := result.catalog, result.err
 		if err != nil {
 			discoverErrors = append(discoverErrors, fmt.Errorf("discover %s: %w", id, err))
 			runtime.update(func(diagnostics *ProviderDiagnostics) {
@@ -217,7 +281,10 @@ func (s *Scheduler) Subscribe(subscription Subscription) *Handle {
 		s.mu.Unlock()
 		return handle
 	}
-	s.subscriptions[id] = &subscriptionEntry{subscription: subscription, metricSet: metricSet, handle: handle}
+	s.subscriptions[id] = &subscriptionEntry{
+		subscription: subscription, metricSet: metricSet,
+		lastDelivery: make(map[string]time.Time), handle: handle,
+	}
 	s.notifyWorkersLocked()
 	s.mu.Unlock()
 	return handle
@@ -228,7 +295,7 @@ func (s *Scheduler) Diagnostics() []ProviderDiagnostics {
 	result := make([]ProviderDiagnostics, 0, len(s.providerOrder))
 	for _, id := range s.providerOrder {
 		diagnostics := s.runtimes[id].snapshot()
-		metrics, _, consumers := s.demandFor(id)
+		metrics, consumers := s.demandsFor(id)
 		diagnostics.ActiveMetrics = len(metrics)
 		diagnostics.ActiveConsumers = consumers
 		result = append(result, diagnostics)
@@ -245,9 +312,11 @@ func (s *Scheduler) Catalog() Catalog {
 
 func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 	backoff := firstBackoff
+	consecutiveFailures := 0
+	lastAttempt := make(map[MetricID]time.Time)
 	for {
-		metricIDs, interval, _ := s.demandFor(runtime.provider.ID())
-		if len(metricIDs) == 0 {
+		demands, _ := s.demandsFor(runtime.provider.ID())
+		if len(demands) == 0 {
 			runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "idle" })
 			select {
 			case <-ctx.Done():
@@ -257,16 +326,44 @@ func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 				continue
 			}
 		}
+		now := time.Now()
+		metricIDs := make([]MetricID, 0, len(demands))
+		wait := s.options.MaxInterval
+		for _, demand := range demands {
+			last := lastAttempt[demand.id]
+			next := last.Add(demand.interval)
+			if last.IsZero() || !now.Before(next) {
+				metricIDs = append(metricIDs, demand.id)
+				continue
+			}
+			if remaining := time.Until(next); remaining < wait {
+				wait = remaining
+			}
+		}
+		if len(metricIDs) == 0 {
+			if !waitForWake(ctx, runtime.wake, wait) {
+				runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "stopped" })
+				return
+			}
+			continue
+		}
 
 		runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "running" })
 		started := time.Now()
+		for _, metricID := range metricIDs {
+			lastAttempt[metricID] = started
+		}
 		sampleCtx, cancel := context.WithTimeout(ctx, s.options.ProviderTimeout)
 		frame, err := runtime.provider.Sample(sampleCtx, metricIDs)
 		cancel()
 		latency := time.Since(started)
 		if err != nil {
+			consecutiveFailures++
 			runtime.update(func(diagnostics *ProviderDiagnostics) {
 				diagnostics.State = "backoff"
+				if consecutiveFailures >= 5 {
+					diagnostics.State = "circuit-open"
+				}
 				diagnostics.LastError = err.Error()
 				diagnostics.LastLatency = latency
 			})
@@ -280,7 +377,11 @@ func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 				})
 			}
 			s.publish(runtime, failure)
-			if !waitForWake(ctx, runtime.wake, backoff) {
+			failureDelay := backoff
+			if consecutiveFailures >= 5 {
+				failureDelay = maximumBackoff
+			}
+			if !waitForWake(ctx, runtime.wake, failureDelay) {
 				runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "stopped" })
 				return
 			}
@@ -292,6 +393,7 @@ func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 		}
 
 		backoff = firstBackoff
+		consecutiveFailures = 0
 		runtime.update(func(diagnostics *ProviderDiagnostics) {
 			diagnostics.State = "running"
 			diagnostics.LastSuccess = time.Now()
@@ -299,17 +401,20 @@ func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 			diagnostics.LastLatency = latency
 		})
 		s.publish(runtime, frame)
-		if !waitForWake(ctx, runtime.wake, interval) {
-			runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "stopped" })
-			return
-		}
 	}
 }
 
 func (s *Scheduler) publish(runtime *providerRuntime, frame Frame) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deliveryTime := frame.FinishedAt
+	if deliveryTime.IsZero() {
+		deliveryTime = time.Now()
+	}
 	for _, entry := range s.subscriptions {
+		if last := entry.lastDelivery[runtime.provider.ID()]; !last.IsZero() && deliveryTime.Sub(last) < entry.subscription.Interval {
+			continue
+		}
 		filtered := frame
 		filtered.Samples = make([]Sample, 0, len(frame.Samples))
 		for _, sample := range frame.Samples {
@@ -320,17 +425,17 @@ func (s *Scheduler) publish(runtime *providerRuntime, frame Frame) {
 		if len(filtered.Samples) == 0 {
 			continue
 		}
+		entry.lastDelivery[runtime.provider.ID()] = deliveryTime
 		if deliverLatest(entry.handle.frames, filtered) {
 			runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.DroppedFrames++ })
 		}
 	}
 }
 
-func (s *Scheduler) demandFor(providerID string) ([]MetricID, time.Duration, int) {
+func (s *Scheduler) demandsFor(providerID string) ([]metricDemand, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	metricSet := make(map[MetricID]struct{})
-	interval := s.options.MaxInterval
+	intervals := make(map[MetricID]time.Duration)
 	consumers := 0
 	for _, entry := range s.subscriptions {
 		consumerUsesProvider := false
@@ -338,26 +443,25 @@ func (s *Scheduler) demandFor(providerID string) ([]MetricID, time.Duration, int
 			if s.metricProvider[metricID] != providerID {
 				continue
 			}
-			metricSet[metricID] = struct{}{}
 			consumerUsesProvider = true
 			effective := entry.subscription.Interval
 			if descriptor := s.descriptors[metricID]; descriptor.MinInterval > effective {
 				effective = descriptor.MinInterval
 			}
-			if effective < interval {
-				interval = effective
+			if previous, exists := intervals[metricID]; !exists || effective < previous {
+				intervals[metricID] = effective
 			}
 		}
 		if consumerUsesProvider {
 			consumers++
 		}
 	}
-	metricIDs := make([]MetricID, 0, len(metricSet))
-	for metricID := range metricSet {
-		metricIDs = append(metricIDs, metricID)
+	demands := make([]metricDemand, 0, len(intervals))
+	for metricID, interval := range intervals {
+		demands = append(demands, metricDemand{id: metricID, interval: interval})
 	}
-	sort.Slice(metricIDs, func(i, j int) bool { return metricIDs[i] < metricIDs[j] })
-	return metricIDs, interval, consumers
+	sort.Slice(demands, func(i, j int) bool { return demands[i].id < demands[j].id })
+	return demands, consumers
 }
 
 func (s *Scheduler) unsubscribe(id uint64) {

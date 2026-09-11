@@ -2,6 +2,7 @@ package linuxfs
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sort"
 	"strings"
@@ -35,7 +36,10 @@ func (p *HWMon) ID() string {
 	return "linux.hwmon"
 }
 
-func (p *HWMon) Discover(context.Context) (telemetry.Catalog, error) {
+func (p *HWMon) Discover(ctx context.Context) (telemetry.Catalog, error) {
+	if err := ctx.Err(); err != nil {
+		return telemetry.Catalog{}, err
+	}
 	chips, err := p.filesystem.ReadDir(hwmonDirectory)
 	if err != nil {
 		return telemetry.Catalog{}, err
@@ -44,6 +48,9 @@ func (p *HWMon) Discover(context.Context) (telemetry.Catalog, error) {
 	var descriptors []telemetry.Descriptor
 	var devices []hardware.Device
 	for _, chipEntry := range chips {
+		if err := ctx.Err(); err != nil {
+			return telemetry.Catalog{}, err
+		}
 		chipPath := hwmonDirectory + "/" + chipEntry.Name()
 		chipNameBytes, err := p.filesystem.ReadFile(chipPath + "/name")
 		if err != nil {
@@ -55,14 +62,24 @@ func (p *HWMon) Discover(context.Context) (telemetry.Catalog, error) {
 		if strings.Contains(lowerName, "gpu") || strings.Contains(lowerName, "nvidia") {
 			kind = hardware.KindGPU
 		}
-		deviceID := hardware.NewDeviceID(kind, chipName, chipName)
-		devices = append(devices, hardware.Device{ID: deviceID, Kind: kind, Vendor: chipName, Name: chipName})
+		nativeID := chipPath
+		if realPath, err := p.filesystem.RealPath(chipPath); err == nil {
+			nativeID = hwmonDevicePath(realPath)
+		}
+		deviceID := hardware.NewDeviceID(kind, chipName, nativeID)
+		devices = append(devices, hardware.Device{
+			ID: deviceID, Kind: kind, Vendor: chipName, Name: chipName,
+			Attributes: map[string]string{"native_id": nativeID},
+		})
 
 		entries, err := p.filesystem.ReadDir(chipPath)
 		if err != nil {
 			continue
 		}
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return telemetry.Catalog{}, err
+			}
 			name := entry.Name()
 			metricKind, channel, divisor, unit, minimum, ok := classifyHWMonInput(name)
 			if !ok {
@@ -74,10 +91,9 @@ func (p *HWMon) Discover(context.Context) (telemetry.Catalog, error) {
 					label = value
 				}
 			}
-			metricID := telemetry.MetricID(fmt.Sprintf("hwmon.%s.%s.%s", slug(chipName), slug(label), metricKind))
-			if _, duplicate := metrics[metricID]; duplicate {
-				metricID = telemetry.MetricID(fmt.Sprintf("%s.%s", metricID, slug(channel)))
-			}
+			metricID := telemetry.MetricID(fmt.Sprintf(
+				"hwmon.%s.%s.%s.%s.%s", slug(chipName), nativeFingerprint(nativeID), slug(label), slug(channel), metricKind,
+			))
 			metrics[metricID] = hwmonMetric{path: chipPath + "/" + name, divisor: divisor}
 			descriptors = append(descriptors, telemetry.Descriptor{
 				ID: metricID, ProviderID: p.ID(), DeviceID: deviceID, Label: label,
@@ -143,4 +159,16 @@ func slug(value string) string {
 		}
 	}
 	return strings.TrimSuffix(builder.String(), "-")
+}
+
+func hwmonDevicePath(realPath string) string {
+	if index := strings.LastIndex(realPath, "/hwmon/"); index >= 0 {
+		return realPath[:index]
+	}
+	return realPath
+}
+
+func nativeFingerprint(nativeID string) string {
+	sum := sha256.Sum256([]byte(nativeID))
+	return fmt.Sprintf("%x", sum[:4])
 }
