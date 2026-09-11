@@ -36,7 +36,8 @@ Tune stages changes locally and requires review before authorization. Applied re
 | --- | --- | --- |
 | Overview, Monitor, and Hardware telemetry | Implemented | Normal-user GUI with visible-page subscriptions. |
 | Tune staging, review, temporary apply, and rollback | Implemented | Semantic controls, read-back verification, and a short-lived helper session. |
-| PL1, PL2, EPP, and TCC | Hardware-dependent | Kernel-backed controls; power targets use practical 1 W review increments and require exact read-back. |
+| PL1 and TCC | Validated on the 275HX | Conservative 44→43→44 W and 95→94→95 °C cycles passed exact apply and restore read-back. |
+| PL2 and EPP | Hardware-dependent | PL2 is read-only when the kernel omits a safe upper bound. EPP is disabled when the active `intel_pstate` performance governor rejects preference changes. |
 | Turbo time window (Tau) | Read-only | Sysfs microseconds do not establish the hardware's representable time windows. |
 | P-core ratios and core/cache voltage offsets | Read-only | Writability, lock state, and stock restoration cannot yet be established safely, including on the 275HX. Tested codecs do not authorize production writes. |
 | E-core ratios | Read-only | The register layout remains unverified. |
@@ -52,7 +53,7 @@ A kernel panic, power loss, or hard lock cannot be repaired by a running user-sp
 
 ## Supported environment and 275HX validation
 
-Studio targets Linux systems with the kernel interfaces needed by each advertised capability. The current validation target is the Intel Core Ultra 9 275HX (GenuineIntel family 6, model `0xC6`, stepping 2). The recorded read-only probe establishes interface availability; it does not prove voltage writability, firmware lock state, or safe hardware restoration. No hardware mutation was performed for the final safety fixes. Mutating validation remains an opt-in developer procedure, not a release claim.
+Studio targets Linux systems with the kernel interfaces needed by each advertised capability. The current validation target is the Intel Core Ultra 9 275HX (GenuineIntel family 6, model `0xC6`, stepping 2). A guarded local smoke test verified temporary PL1 and thermal-limit changes plus exact restoration to stock. On this host EPP is correctly reported as kernel-blocked because `intel_pstate` is in performance mode; PL2, Tau, ratios, and voltage offsets remain read-only for the reasons shown in Tune. Mutating validation remains an opt-in developer procedure, not a blanket support claim for other machines.
 
 ## Build and run
 
@@ -77,7 +78,7 @@ Distribution packaging installs that helper at its fixed policy-controlled path.
 - [Studio design](docs/superpowers/specs/2026-09-11-undervolt-go-studio-design.md)
 - [Intel tuning backend design](docs/superpowers/specs/2026-09-11-intel-tuning-backend-design.md)
 - [275HX validation runbook](docs/validation/intel-275hx-runbook.md)
-- [275HX read-only verification](docs/validation/intel-275hx-read-only.md)
+- [275HX hardware verification](docs/validation/intel-275hx-read-only.md)
 - [GPL-3.0 license](LICENSE.txt)
 
 Forked from [Softorage/undervolt-go](https://github.com/Softorage/undervolt-go). Original history and authorship are retained.

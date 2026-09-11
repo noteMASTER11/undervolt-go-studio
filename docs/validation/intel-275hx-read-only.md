@@ -1,13 +1,15 @@
-# Intel Core Ultra 9 275HX read-only verification
+# Intel Core Ultra 9 275HX hardware verification
 
 Date: 2026-09-11 (Asia/Tbilisi)
-Verification baseline: `241f515ac21a415403176bae19daba5b875e4a11` (`fix: hydrate drivers before smoke recovery`)
+Validated implementation: `47dcbb5` (`fix: handle kernel-blocked EPP recovery`)
 
-## Final safety-wave update
+## Final hardware result
 
-The sections below record the earlier baseline, not current writable capability claims. The final safety wave based on `fa1c7bc` repeated the default read-only probe at 22:08:01 +04:00 on the same date, with exit 0 and no hardware mutation. PL1 remains 44 W with a 55 W maximum, now using practical 1 W review increments; PL2 remains read-only at 44 W because its upper bound is unknown. Tau is now unconditionally read-only because representable time-window resolution is unverified, independently of whether bounds are present. TCC remains 95 °C and EPP remains `default` with the same reported choices.
+The final guarded smoke run exited 0. It applied PL1 at 43 W and restored 44 W, then applied a 94 °C thermal limit and restored 95 °C. Every transition used exact read-back. The recovery journal was absent after completion.
 
-P-core ratio discovery may read the strictly allow-listed register, but never authorizes new ratio writes; the normal-user probe remains `kernel_blocked`. Core/cache voltage discovery is now read-only with unknown values and an explicit unverified-writability reason. It does not issue even a mailbox read command, which would itself require an MSR write. No safe writability/lock/stock-restoration probe has been established. The deterministic screenshot now uses read-only ratio/voltage capabilities, not the historical supported-ratio/firmware-lock illustration below. New MSR Apply is disabled in production; only restoration of an existing durable, same-machine/same-boot snapshot remains available under the exclusive recovery lock.
+An initial run exposed a real kernel restriction: active HWP `intel_pstate` with the `performance` governor rejects non-performance EPP writes with `EBUSY`. The failed write left all policies at their captured `default` value. Recovery now treats an already-matching snapshot as verified without issuing a redundant write, and discovery reports EPP as `kernel_blocked` with reason code `intel_pstate_performance_governor`. The final run therefore skipped EPP instead of presenting it as writable.
+
+PL2 remains read-only at 44 W because its safe upper bound is unknown. Tau remains read-only because the representable time-window resolution is unverified. P-core ratios, E-core ratios, and core/cache voltage offsets remain read-only because safe production writes and exact stock restoration have not been established.
 
 ## Host and CPUID
 
@@ -27,10 +29,10 @@ Result: exit 0; report written to `build/275hx-read-only.json` in `read-only` mo
 
 The probe found the following controls:
 
-- Powercap: PL1 is supported at 44 W (0–55 W); PL2 is read-only at 44 W and turbo time is read-only at 27.983872 s because the kernel does not expose writable upper bounds.
+- Powercap: PL1 is supported at 44 W (0–55 W); PL2 is read-only at 44 W because the kernel does not expose a safe upper bound; Tau is read-only at 27.983872 s because representable time windows are unknown.
 - TCC: the thermal limit is supported at 95 °C (0–105 °C).
-- EPP: energy preference is supported, currently `default`, with `default`, `performance`, `balance_performance`, `balance_power`, and `power` choices.
-- MSR controls do not fabricate values. P-core ratios and core/cache voltage offsets report `kernel_blocked` with `msr_permission_denied` when `/dev/cpu/0/msr` cannot be opened; E-core ratios are read-only because their register layout is not verified.
+- EPP: current value is `default`, but the control is `kernel_blocked` while `intel_pstate` uses the `performance` governor.
+- MSR controls do not fabricate writable support. The P-core vector is read-only; E-core layout is unverified; core/cache voltage values and writability remain unknown.
 
 ## Automated verification
 
@@ -46,7 +48,7 @@ go build -o build/undervolt-go-studio-helper ./cmd/helper
 go build -o build/tuning-smoke ./cmd/tuning-smoke
 ```
 
-No root prompt occurred during those commands or the read-only probe.
+The automated commands and read-only probe require no root prompt. Only the explicitly guarded hardware smoke used `pkexec`.
 
 ## Headless Tune UI review
 
@@ -58,10 +60,16 @@ go run ./cmd/ui-snapshot --page tune --scenario intel-275hx --output build/tune-
 
 Screenshot: `build/tune-275hx.png` (1600 × 1000).
 
-The deterministic `intel-275hx` scenario renders PL1/PL2 at 44 W, a 95 °C thermal ceiling, EPP choices, a supported P-core ratio vector, and a firmware-locked core voltage control using the injected Tune service. The locked-voltage capability deliberately leaves `Current` unset and omits `Range`; the primary UI therefore does not imply that a 0 mV value is available. The Tune capture waits for completed discovery after its final state has rendered, rather than sleeping for a fixed interval. The snapshot path does not construct or call the `pkexec` client.
+The deterministic `intel-275hx` scenario renders PL1/PL2 at 44 W, a 95 °C thermal ceiling, and explicit disabled states for controls that are not safely writable. The Tune capture waits for completed discovery after its final state has rendered, rather than sleeping for a fixed interval. The snapshot path does not construct or call the `pkexec` client.
 
 Visual inspection using the local image viewer found readable labels and disabled states, no overlapping cards, no clipped labels, a visible Pending changes rail, and no raw technical data in the primary view. The lower control cards remain accessible through the visible content scrollbar. The Fyne runtime emitted a non-fatal locale-`C` parsing diagnostic while rendering; the command still exited 0 and produced the PNG.
 
-## Safety statement
+## Guarded mutation evidence
 
-This verification used only the default read-only `tuning-smoke` mode and a Fyne headless test canvas. It did not use `--mutate`, `pkexec`, native/active windows, or any hardware write operation.
+Command:
+
+```bash
+pkexec build/tuning-smoke --mutate --confirm 'I UNDERSTAND TEMPORARY CPU TUNING' --output build/275hx-final-smoke.json
+```
+
+Result: exit 0. Cases `power-limits` and `thermal-limit` both recorded requested, effective, and restored values. EPP was omitted because discovery marked it kernel-blocked. A privileged existence check confirmed that `/run/undervolt-go-studio/recovery-v1.json` did not remain after the run.
