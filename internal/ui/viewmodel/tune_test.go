@@ -193,9 +193,13 @@ type controlledTuneService struct {
 	mu           sync.Mutex
 	discovery    []chan tuning.DiscoveryResult
 	applyCount   int
+	applyErr     error
 	applyStarted chan struct{}
 	applyRelease chan struct{}
 	events       chan tuning.Event
+	revertCount  int
+	revertErr    error
+	closeErr     error
 }
 
 func (service *controlledTuneService) Discover(context.Context) <-chan tuning.DiscoveryResult {
@@ -220,6 +224,9 @@ func (service *controlledTuneService) Apply(ctx context.Context, _ tuning.Change
 		case <-service.applyRelease:
 		}
 	}
+	if service.applyErr != nil {
+		return nil, service.applyErr
+	}
 	if service.events != nil {
 		return service.events, nil
 	}
@@ -228,8 +235,13 @@ func (service *controlledTuneService) Apply(ctx context.Context, _ tuning.Change
 	return events, nil
 }
 
-func (service *controlledTuneService) Revert(context.Context) error { return nil }
-func (service *controlledTuneService) Close(context.Context) error  { return nil }
+func (service *controlledTuneService) Revert(context.Context) error {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.revertCount++
+	return service.revertErr
+}
+func (service *controlledTuneService) Close(context.Context) error { return service.closeErr }
 
 func (service *controlledTuneService) requestCount() int {
 	service.mu.Lock()
@@ -300,5 +312,41 @@ func TestTuneLeaseRollbackClearsActiveSession(t *testing.T) {
 	vm.consumeEvents(stream)
 	if state := vm.State(); state.SessionActive || state.Phase != PhaseIdle {
 		t.Fatalf("lease rollback left UI active: %+v", state)
+	}
+}
+
+func TestTuneKeepsStartupRecoveryFailureUntilRetryIsVerified(t *testing.T) {
+	startupErr := &tuning.RollbackError{Cause: errors.New("startup recovery failed")}
+	retryErr := &tuning.RollbackError{Cause: errors.New("retry recovery failed")}
+	service := &controlledTuneService{applyErr: startupErr, revertErr: retryErr, closeErr: retryErr}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(44)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := viewModel.Review(); err != nil {
+		t.Fatal(err)
+	}
+	if err := viewModel.Apply(context.Background()); !errors.Is(err, startupErr) {
+		t.Fatalf("apply error = %v, want startup recovery failure", err)
+	}
+	if err := viewModel.Revert(context.Background()); !errors.Is(err, retryErr) {
+		t.Fatalf("retry error = %v, want recovery failure", err)
+	}
+	state := viewModel.State()
+	if state.Phase != PhaseRollbackIncomplete || !state.SessionActive || state.LastError == "" {
+		t.Fatalf("recovery warning cleared after failed retry: %+v", state)
+	}
+	service.mu.Lock()
+	revertCount := service.revertCount
+	service.mu.Unlock()
+	if revertCount != 1 {
+		t.Fatalf("revert calls = %d, want 1", revertCount)
+	}
+	if err := viewModel.Close(); !errors.Is(err, retryErr) {
+		t.Fatalf("close error = %v, want recovery failure", err)
+	}
+	if state := viewModel.State(); state.Phase != PhaseRollbackIncomplete || !state.SessionActive {
+		t.Fatalf("recovery warning cleared after failed close: %+v", state)
 	}
 }

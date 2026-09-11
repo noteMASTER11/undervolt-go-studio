@@ -144,6 +144,12 @@ func (service *desktopTuneService) Apply(ctx context.Context, changes tuning.Cha
 		}
 		connected, capabilities, err := dial(operationContext, service.build)
 		if err != nil {
+			var incomplete *tuning.RollbackError
+			if errors.As(err, &incomplete) {
+				service.mu.Lock()
+				service.recoveryNeeded = true
+				service.mu.Unlock()
+			}
 			return nil, err
 		}
 		service.mu.Lock()

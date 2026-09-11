@@ -237,6 +237,43 @@ func TestDesktopCloseDoesNotDiscardRecoveryAfterHelperLoss(t *testing.T) {
 	}
 }
 
+func TestDesktopTuneServiceRetriesRecoveryAfterFailedStartupHandshake(t *testing.T) {
+	recovered := &fakeTuneSession{}
+	dialCount := 0
+	service := &desktopTuneService{dial: func(context.Context, string) (tuneSession, tuning.CapabilitySet, error) {
+		dialCount++
+		if dialCount == 1 {
+			return nil, tuning.CapabilitySet{}, &tuning.RollbackError{Cause: errors.New("startup recovery failed")}
+		}
+		return recovered, tuning.CapabilitySet{Generation: "g"}, nil
+	}}
+
+	if _, err := service.Apply(context.Background(), tuning.ChangeSet{Generation: "g"}); err == nil {
+		t.Fatal("startup recovery failure was discarded")
+	}
+	if err := service.Close(context.Background()); err == nil {
+		t.Fatal("window could close after unverified startup recovery")
+	}
+	if dialCount != 1 {
+		t.Fatalf("close retried authorization unexpectedly: dials = %d", dialCount)
+	}
+	if err := service.Revert(context.Background()); err != nil {
+		t.Fatalf("retry recovery: %v", err)
+	}
+	if dialCount != 2 {
+		t.Fatalf("retry dials = %d, want 2", dialCount)
+	}
+	if recovered.closeCount() != 1 {
+		t.Fatalf("recovered session closes = %d, want 1", recovered.closeCount())
+	}
+	service.mu.Lock()
+	needsRecovery := service.recoveryNeeded
+	service.mu.Unlock()
+	if needsRecovery {
+		t.Fatal("verified recovery remained armed")
+	}
+}
+
 func (session *fakeTuneSession) closeCount() int {
 	session.mu.Lock()
 	defer session.mu.Unlock()
