@@ -236,6 +236,13 @@ func (s *Scheduler) Diagnostics() []ProviderDiagnostics {
 	return result
 }
 
+// Catalog returns an immutable snapshot of the latest discovery result.
+func (s *Scheduler) Catalog() Catalog {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneCatalog(s.catalog)
+}
+
 func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 	backoff := firstBackoff
 	for {

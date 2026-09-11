@@ -10,12 +10,14 @@ import (
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/pages"
+	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/viewmodel"
 )
 
 // Shell is the persistent XTU-style navigation and tuning frame.
 type Shell struct {
 	info      product.Info
 	scheduler *telemetry.Scheduler
+	catalog   telemetry.Catalog
 	navigator *LazyNavigator
 	center    *fyne.Container
 	root      fyne.CanvasObject
@@ -27,9 +29,10 @@ type Shell struct {
 
 func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack()}
+	source := viewmodel.SchedulerSource{Scheduler: scheduler}
 	factories := []PageFactory{
-		placeholderFactory("overview", "Overview", theme.HomeIcon(), "Hardware discovery is starting."),
-		placeholderFactory("monitor", "Monitor", theme.VisibilityIcon(), "Live monitoring is not connected yet."),
+		{ID: "overview", Label: "Overview", Icon: theme.HomeIcon(), Create: func() Page { return pages.NewOverview(source, shell.catalog) }},
+		{ID: "monitor", Label: "Monitor", Icon: theme.VisibilityIcon(), Create: func() Page { return pages.NewMonitor(source, shell.catalog) }},
 		placeholderFactory("tune", "Tune", theme.SettingsIcon(), "Tuning is disabled in the read-only milestone."),
 		placeholderFactory("stress", "Stress Tests", theme.MediaPlayIcon(), "Stress engines are delivered in a later milestone."),
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
@@ -100,6 +103,18 @@ func (s *Shell) Select(id string) error {
 
 func (s *Shell) SetStatus(status string) {
 	s.statusLabel.SetText(status)
+}
+
+func (s *Shell) SetCatalog(catalog telemetry.Catalog) {
+	s.catalog = telemetry.Catalog{
+		Devices: append(catalog.Devices[:0:0], catalog.Devices...),
+		Metrics: append(catalog.Metrics[:0:0], catalog.Metrics...),
+	}
+	for _, page := range s.navigator.pages {
+		if livePage, ok := page.(interface{ SetCatalog(telemetry.Catalog) }); ok {
+			livePage.SetCatalog(s.catalog)
+		}
+	}
 }
 
 func (s *Shell) Deactivate() {

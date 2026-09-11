@@ -95,7 +95,10 @@ func (d *Desktop) start() {
 		if err != nil {
 			status = fmt.Sprintf("Discovery completed with warnings: %v", err)
 		}
-		fyne.Do(func() { shell.SetStatus(status) })
+		fyne.Do(func() {
+			shell.SetCatalog(catalog)
+			shell.SetStatus(status)
+		})
 	}()
 }
 

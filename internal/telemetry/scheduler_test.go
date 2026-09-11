@@ -31,6 +31,19 @@ func TestSchedulerDoesNotPollWithoutSubscribers(t *testing.T) {
 	}
 }
 
+func TestSchedulerCatalogReturnsCopy(t *testing.T) {
+	provider := fake.New(fake.Options{ProviderID: "fake", MetricCount: 1})
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, testOptions())
+	if _, err := scheduler.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := scheduler.Catalog()
+	first.Metrics[0].Label = "changed"
+	if got := scheduler.Catalog().Metrics[0].Label; got == "changed" {
+		t.Fatal("Catalog returned mutable scheduler storage")
+	}
+}
+
 func TestSchedulerBatchesRequestedMetrics(t *testing.T) {
 	provider := fake.New(fake.Options{ProviderID: "fake", MetricCount: 3})
 	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, testOptions())
