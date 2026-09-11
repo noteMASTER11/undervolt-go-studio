@@ -40,6 +40,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	var common []string
 	var current []string
 	var revisionPaths []string
+	performanceGovernorBlocked := false
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -53,6 +54,11 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		currentRaw, currentErr := driver.store.Read(base + "/energy_performance_preference")
 		if availableErr != nil || currentErr != nil {
 			continue
+		}
+		scalingDriver, scalingDriverErr := driver.store.Read(base + "/scaling_driver")
+		scalingGovernor, scalingGovernorErr := driver.store.Read(base + "/scaling_governor")
+		if scalingDriverErr == nil && scalingGovernorErr == nil && strings.TrimSpace(string(scalingDriver)) == "intel_pstate" && strings.TrimSpace(string(scalingGovernor)) == "performance" {
+			performanceGovernorBlocked = true
 		}
 		available := strings.Fields(string(availableRaw))
 		if len(available) == 0 {
@@ -81,6 +87,10 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		state = tuning.StateKernelBlocked
 		reasonCode = "no_common_preference"
 		reason = "CPU policies do not expose a common energy preference"
+	} else if performanceGovernorBlocked {
+		state = tuning.StateKernelBlocked
+		reasonCode = "intel_pstate_performance_governor"
+		reason = "intel_pstate performance mode rejects energy-preference changes; select a balanced system power profile first"
 	}
 	currentChoice := current[0]
 	for _, choice := range current[1:] {
@@ -232,6 +242,13 @@ func (operation *operation) rollback(count int) error {
 }
 
 func writeChoice(store sysfs.Store, path, choice string) error {
+	current, err := store.Read(path)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(current)) == choice {
+		return nil
+	}
 	if err := store.Write(path, []byte(choice)); err != nil {
 		return err
 	}

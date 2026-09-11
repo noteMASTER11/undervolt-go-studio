@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -64,6 +65,54 @@ func TestEPPChoicesAreIntersectionAcrossPolicies(t *testing.T) {
 	}
 	if caps[0].Current.Choice != "mixed" {
 		t.Fatalf("mixed current = %#v", caps[0].Current)
+	}
+}
+
+func TestEPPIsKernelBlockedByIntelPstatePerformanceGovernor(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance balance_power power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "performance\n",
+	})
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "intel_pstate_performance_governor" || capability.Reason == "" {
+		t.Fatalf("performance-governor capability = %+v", capability)
+	}
+}
+
+func TestEPPRestoreAcceptsAlreadyRestoredValueWhenKernelRejectsWrites(t *testing.T) {
+	const preferencePath = eppRoot + "/policy0/energy_performance_preference"
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+	})
+	driver := New(store)
+	if _, err := driver.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	op, err := driver.Prepare(context.Background(), tuning.Change{ID: tuning.ControlEPP, Requested: tuning.ChoiceValue("power")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := op.Capture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Fail("write", preferencePath, errors.New("device or resource busy"))
+	if _, err := op.Restore(context.Background(), snapshot); err != nil {
+		t.Fatalf("already-restored value required an unnecessary write: %v", err)
+	}
+	if len(store.Writes) != 0 {
+		t.Fatalf("already-restored value caused %d writes", len(store.Writes))
 	}
 }
 
