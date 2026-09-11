@@ -23,6 +23,12 @@ const (
 	PhaseRollbackIncomplete = "rollback_incomplete"
 )
 
+var (
+	ErrReviewRequired  = errors.New("tuning changes must be reviewed before apply")
+	ErrApplyInProgress = errors.New("a tuning apply is already in progress")
+	ErrSessionActive   = errors.New("revert the active tuning session before editing")
+)
+
 type TuneService interface {
 	Discover(context.Context) <-chan tuning.DiscoveryResult
 	Apply(context.Context, tuning.ChangeSet) (<-chan tuning.Event, error)
@@ -31,13 +37,15 @@ type TuneService interface {
 }
 
 type TuneState struct {
-	Active       bool
-	Phase        string
-	Capabilities tuning.CapabilitySet
-	Pending      []tuning.Change
-	Review       []ReviewRow
-	Effective    map[tuning.ControlID]tuning.Value
-	LastError    string
+	Active        bool
+	SessionActive bool
+	PendingValid  bool
+	Phase         string
+	Capabilities  tuning.CapabilitySet
+	Pending       []tuning.Change
+	Review        []ReviewRow
+	Effective     map[tuning.ControlID]tuning.Value
+	LastError     string
 }
 
 type ReviewRow struct {
@@ -109,6 +117,14 @@ func (viewModel *Tune) Deactivate() {
 
 func (viewModel *Tune) Stage(id tuning.ControlID, value tuning.Value) error {
 	viewModel.mu.Lock()
+	if viewModel.state.SessionActive {
+		viewModel.mu.Unlock()
+		return ErrSessionActive
+	}
+	if viewModel.state.Phase == PhaseAuthorizing || viewModel.state.Phase == PhaseApplying || viewModel.state.Phase == PhaseRollingBack {
+		viewModel.mu.Unlock()
+		return ErrApplyInProgress
+	}
 	pending := append([]tuning.Change(nil), viewModel.state.Pending...)
 	found := false
 	for index := range pending {
@@ -121,9 +137,8 @@ func (viewModel *Tune) Stage(id tuning.ControlID, value tuning.Value) error {
 	if !found {
 		pending = append(pending, tuning.Change{ID: id, Requested: cloneValue(value)})
 	}
-	set := tuning.ChangeSet{Generation: viewModel.state.Capabilities.Generation, MachineID: viewModel.state.Capabilities.MachineID, Changes: pending}
-	_, err := tuning.ValidateChangeSet(viewModel.state.Capabilities, set)
 	viewModel.state.Pending = pending
+	err := viewModel.validatePendingLocked()
 	viewModel.state.Review = nil
 	viewModel.state.Phase = PhaseStaged
 	viewModel.state.LastError = ""
@@ -139,6 +154,7 @@ func (viewModel *Tune) Stage(id tuning.ControlID, value tuning.Value) error {
 func (viewModel *Tune) Reset() {
 	viewModel.mu.Lock()
 	viewModel.state.Pending = nil
+	viewModel.state.PendingValid = false
 	viewModel.state.Review = nil
 	viewModel.state.LastError = ""
 	if viewModel.state.Phase != PhaseActive {
@@ -181,6 +197,7 @@ func (viewModel *Tune) Review() ([]ReviewRow, error) {
 		})
 	}
 	viewModel.state.Review = rows
+	viewModel.state.PendingValid = true
 	viewModel.state.Phase = PhaseReviewing
 	viewModel.state.LastError = ""
 	state, listener := viewModel.stateLocked(), viewModel.listener
@@ -189,8 +206,37 @@ func (viewModel *Tune) Review() ([]ReviewRow, error) {
 	return append([]ReviewRow(nil), rows...), nil
 }
 
+func (viewModel *Tune) CancelReview() {
+	viewModel.mu.Lock()
+	if viewModel.state.Phase != PhaseReviewing || viewModel.state.SessionActive {
+		viewModel.mu.Unlock()
+		return
+	}
+	viewModel.state.Review = nil
+	if len(viewModel.state.Pending) > 0 {
+		viewModel.state.Phase = PhaseStaged
+	} else {
+		viewModel.state.Phase = PhaseIdle
+	}
+	state, listener := viewModel.stateLocked(), viewModel.listener
+	viewModel.mu.Unlock()
+	notify(listener, state)
+}
+
 func (viewModel *Tune) Apply(ctx context.Context) error {
 	viewModel.mu.Lock()
+	if viewModel.state.Phase == PhaseAuthorizing || viewModel.state.Phase == PhaseApplying || viewModel.state.Phase == PhaseRollingBack {
+		viewModel.mu.Unlock()
+		return ErrApplyInProgress
+	}
+	if viewModel.state.SessionActive {
+		viewModel.mu.Unlock()
+		return ErrSessionActive
+	}
+	if viewModel.state.Phase != PhaseReviewing || !viewModel.state.PendingValid {
+		viewModel.mu.Unlock()
+		return ErrReviewRequired
+	}
 	set := tuning.ChangeSet{Generation: viewModel.state.Capabilities.Generation, MachineID: viewModel.state.Capabilities.MachineID, Changes: append([]tuning.Change(nil), viewModel.state.Pending...)}
 	viewModel.state.Phase = PhaseAuthorizing
 	state, listener := viewModel.stateLocked(), viewModel.listener
@@ -227,8 +273,10 @@ func (viewModel *Tune) Revert(ctx context.Context) error {
 	}
 	viewModel.mu.Lock()
 	viewModel.state.Pending = nil
+	viewModel.state.PendingValid = false
 	viewModel.state.Review = nil
 	viewModel.state.Effective = make(map[tuning.ControlID]tuning.Value)
+	viewModel.state.SessionActive = false
 	viewModel.mu.Unlock()
 	viewModel.setPhase(PhaseIdle, "")
 	return nil
@@ -273,6 +321,11 @@ func (viewModel *Tune) consumeDiscovery(ctx context.Context, token uint64, resul
 				continue
 			}
 			viewModel.state.Capabilities = cloneCapabilitySet(result.Set)
+			if len(viewModel.state.Pending) > 0 {
+				if validationErr := viewModel.validatePendingLocked(); validationErr != nil {
+					viewModel.state.LastError = validationErr.Error()
+				}
+			}
 			if result.Err != nil {
 				viewModel.state.LastError = result.Err.Error()
 			}
@@ -300,13 +353,20 @@ func (viewModel *Tune) consumeEvents(events <-chan tuning.Event) {
 			if event.Capabilities != nil {
 				viewModel.state.Capabilities = cloneCapabilitySet(*event.Capabilities)
 			}
-			viewModel.state.Phase = PhaseReviewing
+			viewModel.state.Review = nil
+			viewModel.state.Phase = PhaseStaged
+			viewModel.state.LastError = ""
+			if err := viewModel.validatePendingLocked(); err != nil {
+				viewModel.state.LastError = err.Error()
+			}
 		case "transaction_applied", "applied":
 			viewModel.state.Phase = PhaseActive
+			viewModel.state.SessionActive = true
 		case "rollback_incomplete":
 			viewModel.state.Phase = PhaseRollbackIncomplete
 		case "transaction_failed", "failed":
 			viewModel.state.Phase = PhaseFailed
+			viewModel.state.SessionActive = false
 			viewModel.state.LastError = event.Message
 		default:
 			viewModel.state.Phase = PhaseApplying
@@ -336,6 +396,21 @@ func (viewModel *Tune) stateLocked() TuneState {
 		state.Effective[id] = cloneValue(value)
 	}
 	return state
+}
+
+func (viewModel *Tune) validatePendingLocked() error {
+	if len(viewModel.state.Pending) == 0 {
+		viewModel.state.PendingValid = false
+		return nil
+	}
+	set := tuning.ChangeSet{
+		Generation: viewModel.state.Capabilities.Generation,
+		MachineID:  viewModel.state.Capabilities.MachineID,
+		Changes:    append([]tuning.Change(nil), viewModel.state.Pending...),
+	}
+	_, err := tuning.ValidateChangeSet(viewModel.state.Capabilities, set)
+	viewModel.state.PendingValid = err == nil
+	return err
 }
 
 func cloneCapabilitySet(set tuning.CapabilitySet) tuning.CapabilitySet {

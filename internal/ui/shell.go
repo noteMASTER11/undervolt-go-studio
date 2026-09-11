@@ -20,21 +20,28 @@ type Shell struct {
 	catalog   telemetry.Catalog
 	navigator *LazyNavigator
 	events    *events.Store
+	tune      *viewmodel.Tune
 	center    *fyne.Container
 	root      fyne.CanvasObject
 
-	statusLabel  *widget.Label
-	applyButton  *widget.Button
-	revertButton *widget.Button
+	statusLabel *widget.Label
 }
 
 func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
-	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack(), events: events.NewStore(0)}
+	eventStore := events.NewStore(0)
+	return newShell(info, scheduler, eventStore, newDesktopTuneService(info.Version, eventStore), fyne.Do)
+}
+
+func newShell(info product.Info, scheduler *telemetry.Scheduler, eventStore *events.Store, tuneService viewmodel.TuneService, dispatch func(func())) *Shell {
+	shell := &Shell{info: info, scheduler: scheduler, center: container.NewStack(), events: eventStore}
 	source := viewmodel.SchedulerSource{Scheduler: scheduler}
+	shell.tune = viewmodel.NewTune(tuneService)
 	factories := []PageFactory{
 		{ID: "overview", Label: "Overview", Icon: theme.HomeIcon(), Create: func() Page { return pages.NewOverview(source, shell.catalog) }},
 		{ID: "monitor", Label: "Monitor", Icon: theme.VisibilityIcon(), Create: func() Page { return pages.NewMonitor(source, shell.catalog) }},
-		placeholderFactory("tune", "Tune", theme.SettingsIcon(), "Tuning is disabled in the read-only milestone."),
+		{ID: "tune", Label: "Tune", Icon: theme.SettingsIcon(), Create: func() Page {
+			return pages.NewTuneWithDispatcher(shell.tune, source, shell.catalog, dispatch)
+		}},
 		placeholderFactory("stress", "Stress Tests", theme.MediaPlayIcon(), "Stress engines are delivered in a later milestone."),
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
 		placeholderFactory("reports", "Reports", theme.DocumentIcon(), "Reports are delivered after session recording."),
@@ -59,11 +66,6 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 	)
 
 	shell.statusLabel = widget.NewLabel("Discovering hardware…")
-	shell.applyButton = widget.NewButton("Apply", nil)
-	shell.revertButton = widget.NewButton("Revert", nil)
-	shell.applyButton.Disable()
-	shell.revertButton.Disable()
-
 	header := container.NewPadded(container.NewBorder(
 		nil, nil, nil,
 		container.NewHBox(shell.statusLabel, widget.NewSeparator(), widget.NewLabel(info.Version)),
@@ -106,6 +108,13 @@ func (s *Shell) SetCatalog(catalog telemetry.Catalog) {
 
 func (s *Shell) Deactivate() {
 	s.navigator.Deactivate()
+}
+
+func (s *Shell) CloseTune() error {
+	if s.tune == nil {
+		return nil
+	}
+	return s.tune.Close()
 }
 
 func placeholderFactory(id, label string, icon fyne.Resource, message string) PageFactory {

@@ -23,12 +23,14 @@ func (h *pageHandle) Close() {
 }
 
 type pageSource struct {
-	calls  int
-	handle *pageHandle
+	calls         int
+	handle        *pageHandle
+	subscriptions []telemetry.Subscription
 }
 
-func (s *pageSource) Subscribe(telemetry.Subscription) viewmodel.SubscriptionHandle {
+func (s *pageSource) Subscribe(subscription telemetry.Subscription) viewmodel.SubscriptionHandle {
 	s.calls++
+	s.subscriptions = append(s.subscriptions, subscription)
 	s.handle = &pageHandle{frames: make(chan telemetry.Frame, 1)}
 	return s.handle
 }

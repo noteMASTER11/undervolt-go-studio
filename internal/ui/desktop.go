@@ -18,13 +18,14 @@ type Desktop struct {
 	info      product.Info
 	scheduler *telemetry.Scheduler
 
-	mu      sync.Mutex
-	context context.Context
-	cancel  context.CancelFunc
-	window  fyne.Window
-	shell   *Shell
-	started bool
-	closed  bool
+	mu        sync.Mutex
+	context   context.Context
+	cancel    context.CancelFunc
+	window    fyne.Window
+	shell     *Shell
+	started   bool
+	closed    bool
+	closeDone chan struct{}
 }
 
 // NewDesktop prepares Linux telemetry providers without touching the filesystem.
@@ -37,6 +38,7 @@ func NewDesktop(info product.Info) *Desktop {
 	return &Desktop{
 		info:      info,
 		scheduler: telemetry.NewScheduler(providers, telemetry.SchedulerOptions{}),
+		closeDone: make(chan struct{}),
 	}
 }
 
@@ -55,9 +57,10 @@ func (d *Desktop) Build(application fyne.App) fyne.Window {
 	d.window.SetContent(d.shell.Object())
 	window := d.window
 	d.window.SetCloseIntercept(func() {
-		d.Close()
-		window.SetCloseIntercept(nil)
-		window.Close()
+		beginWindowClose(d.Close, fyne.Do, func() {
+			window.SetCloseIntercept(nil)
+			window.Close()
+		})
 	})
 	return d.window
 }
@@ -106,18 +109,35 @@ func (d *Desktop) start() {
 func (d *Desktop) Close() {
 	d.mu.Lock()
 	if d.closed {
+		done := d.closeDone
 		d.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return
 	}
 	d.closed = true
+	if d.closeDone == nil {
+		d.closeDone = make(chan struct{})
+	}
+	done := d.closeDone
 	cancel := d.cancel
 	shell := d.shell
 	d.mu.Unlock()
+	defer close(done)
 
 	if shell != nil {
+		_ = shell.CloseTune()
 		shell.Deactivate()
 	}
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func beginWindowClose(work func(), dispatch func(func()), finish func()) {
+	go func() {
+		work()
+		dispatch(finish)
+	}()
 }

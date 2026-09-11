@@ -2,6 +2,7 @@ package ui
 
 import (
 	"testing"
+	"time"
 
 	"fyne.io/fyne/v2/test"
 
@@ -24,6 +25,32 @@ func TestDesktopBuildsWindowBeforeDiscovery(t *testing.T) {
 	}
 	if desktop.started {
 		t.Fatal("scheduler started while constructing the window")
+	}
+}
+
+func TestBeginWindowCloseKeepsUIHandlerNonBlocking(t *testing.T) {
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	returned := make(chan struct{})
+	go func() {
+		beginWindowClose(func() { <-release }, func(callback func()) { callback() }, func() { close(finished) })
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("window close handler blocked on rollback")
+	}
+	select {
+	case <-finished:
+		t.Fatal("window closed before rollback work finished")
+	default:
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("window did not close after rollback work")
 	}
 }
 

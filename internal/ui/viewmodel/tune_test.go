@@ -2,6 +2,7 @@ package viewmodel
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -66,10 +67,135 @@ func TestTuneStagesAndReviewsNormalizedValueWithoutApplying(t *testing.T) {
 	viewModel.Deactivate()
 }
 
+func TestTuneApplyRequiresReviewAndRejectsConcurrentConfirmation(t *testing.T) {
+	service := &controlledTuneService{applyStarted: make(chan struct{}), applyRelease: make(chan struct{})}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(44)); err != nil {
+		t.Fatal(err)
+	}
+	if err := viewModel.Apply(context.Background()); !errors.Is(err, ErrReviewRequired) {
+		t.Fatalf("apply without review error = %v", err)
+	}
+	if _, err := viewModel.Review(); err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- viewModel.Apply(context.Background()) }()
+	select {
+	case <-service.applyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first apply did not start")
+	}
+	if err := viewModel.Apply(context.Background()); !errors.Is(err, ErrApplyInProgress) {
+		t.Fatalf("second apply error = %v", err)
+	}
+	close(service.applyRelease)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	viewModel.Deactivate()
+}
+
+func TestTuneKeepsSessionActiveAndRejectsEditsUntilRevert(t *testing.T) {
+	events := make(chan tuning.Event, 1)
+	service := &controlledTuneService{events: events}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(44)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := viewModel.Review(); err != nil {
+		t.Fatal(err)
+	}
+	if err := viewModel.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	events <- tuning.Event{Kind: "transaction_applied"}
+	close(events)
+	waitForTunePhase(t, viewModel, PhaseActive)
+	if !viewModel.State().SessionActive {
+		t.Fatal("applied transaction was not retained as active")
+	}
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(42)); !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("stage during active session error = %v", err)
+	}
+	if viewModel.State().Phase != PhaseActive {
+		t.Fatalf("phase = %q, want active", viewModel.State().Phase)
+	}
+	viewModel.Deactivate()
+}
+
+func TestTuneCancelReviewReturnsToStagedWithoutLosingChanges(t *testing.T) {
+	service := &controlledTuneService{}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(44)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := viewModel.Review(); err != nil {
+		t.Fatal(err)
+	}
+	viewModel.CancelReview()
+	state := viewModel.State()
+	if state.Phase != PhaseStaged || len(state.Pending) != 1 || len(state.Review) != 0 {
+		t.Fatalf("state after cancel = %+v", state)
+	}
+	viewModel.Deactivate()
+}
+
+func TestTuneReviewChangedRequiresFreshReview(t *testing.T) {
+	events := make(chan tuning.Event, 1)
+	service := &controlledTuneService{events: events}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.NumericValue(44)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := viewModel.Review(); err != nil {
+		t.Fatal(err)
+	}
+	if err := viewModel.Apply(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	updated := capabilitySet("privileged")
+	events <- tuning.Event{Kind: "review_changed", Capabilities: &updated}
+	close(events)
+	waitForTunePhase(t, viewModel, PhaseStaged)
+	state := viewModel.State()
+	if len(state.Review) != 0 || len(state.Pending) != 1 {
+		t.Fatalf("state after capability change = %+v", state)
+	}
+	if err := viewModel.Apply(context.Background()); !errors.Is(err, ErrReviewRequired) {
+		t.Fatalf("apply without fresh review error = %v", err)
+	}
+	viewModel.Deactivate()
+}
+
+func TestTuneMarksInvalidPendingSetAsNotReviewable(t *testing.T) {
+	service := &controlledTuneService{}
+	viewModel := NewTune(service)
+	activateTuneWithCapabilities(t, viewModel, service)
+	if err := viewModel.Stage(tuning.ControlPL1, tuning.ChoiceValue("invalid")); err == nil {
+		t.Fatal("invalid staged value was accepted")
+	}
+	state := viewModel.State()
+	if state.PendingValid {
+		t.Fatal("invalid pending set was marked reviewable")
+	}
+	if _, err := viewModel.Review(); err == nil {
+		t.Fatal("invalid pending set was reviewed")
+	}
+	viewModel.Deactivate()
+}
+
 type controlledTuneService struct {
-	mu         sync.Mutex
-	discovery  []chan tuning.DiscoveryResult
-	applyCount int
+	mu           sync.Mutex
+	discovery    []chan tuning.DiscoveryResult
+	applyCount   int
+	applyStarted chan struct{}
+	applyRelease chan struct{}
+	events       chan tuning.Event
 }
 
 func (service *controlledTuneService) Discover(context.Context) <-chan tuning.DiscoveryResult {
@@ -80,10 +206,23 @@ func (service *controlledTuneService) Discover(context.Context) <-chan tuning.Di
 	return request
 }
 
-func (service *controlledTuneService) Apply(context.Context, tuning.ChangeSet) (<-chan tuning.Event, error) {
+func (service *controlledTuneService) Apply(ctx context.Context, _ tuning.ChangeSet) (<-chan tuning.Event, error) {
 	service.mu.Lock()
 	service.applyCount++
 	service.mu.Unlock()
+	if service.applyStarted != nil {
+		close(service.applyStarted)
+	}
+	if service.applyRelease != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-service.applyRelease:
+		}
+	}
+	if service.events != nil {
+		return service.events, nil
+	}
 	events := make(chan tuning.Event)
 	close(events)
 	return events, nil
@@ -109,6 +248,15 @@ func capabilitySet(generation string) tuning.CapabilitySet {
 		ID: tuning.ControlPL1, Label: "Sustained power", Unit: tuning.UnitWatt, State: tuning.StateSupported,
 		Current: tuning.NumericValue(40), Range: &tuning.NumericRange{Minimum: 15, Maximum: 55, Step: 0.125},
 	}}}
+}
+
+func activateTuneWithCapabilities(t *testing.T, viewModel *Tune, service *controlledTuneService) {
+	t.Helper()
+	viewModel.Activate()
+	request := service.lastRequest()
+	request <- tuning.DiscoveryResult{Set: capabilitySet("g"), Complete: true}
+	close(request)
+	waitForTunePhase(t, viewModel, PhaseIdle)
 }
 
 func waitForTunePhase(t *testing.T, viewModel *Tune, phase string) {

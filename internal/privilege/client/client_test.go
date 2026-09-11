@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -35,5 +36,31 @@ func TestClientHandshakeReturnsCapabilities(t *testing.T) {
 	}
 	if err := client.Close(ctx); err != nil && err != io.EOF {
 		t.Fatal(err)
+	}
+}
+
+func TestClientCloseBoundsProcessWaitByContext(t *testing.T) {
+	clientSide, helperSide := net.Pipe()
+	go func() {
+		reader := protocol.NewReaderForDirection(helperSide, protocol.ClientToHelper)
+		_, _ = reader.Read()
+		_ = helperSide.Close()
+	}()
+	waitForever := make(chan struct{})
+	client := NewStreamClient(clientSide, clientSide, func() error { return clientSide.Close() }, func() error {
+		<-waitForever
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- client.Close(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("close error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Close remained blocked after its context expired")
 	}
 }

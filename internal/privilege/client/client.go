@@ -154,7 +154,14 @@ func (client *Client) Close(ctx context.Context) error {
 		requestErr = client.write(client.message(protocol.TypeClose, protocol.ProbePayload{}))
 	}
 	closeErr := client.input.Close()
-	waitErr := client.wait()
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- client.wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-waitResult:
+	case <-ctx.Done():
+		waitErr = ctx.Err()
+	}
 	return errors.Join(requestErr, closeErr, waitErr)
 }
 
