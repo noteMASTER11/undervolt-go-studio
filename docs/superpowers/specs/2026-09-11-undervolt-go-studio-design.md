@@ -72,13 +72,13 @@ The main `undervolt-go-studio` process runs as the logged-in user. It owns:
 - profiles and experiment sessions stored in the user's data directory;
 - stress-test orchestration;
 - report generation;
-- communication with the privileged helper over D-Bus.
+- communication with the privileged helper over a private, versioned child-process pipe.
 
 The GUI performs no blocking I/O on Fyne's main thread.
 
 ### 5.2 Privileged helper
 
-`undervolt-go-studio-helper` is a minimal root service activated through D-Bus and protected by PolicyKit. It exposes only typed, allow-listed operations. It does not accept shell commands, file paths supplied for arbitrary writes, raw scripts, or unrestricted MSR addresses.
+`undervolt-go-studio-helper` is a minimal root session process launched through `pkexec` after the user confirms a reviewed change set. The GUI executes a fixed installed path and fixed argument vector without a shell. The helper communicates over a private, versioned stdin/stdout protocol and exposes only typed, allow-listed operations. It does not accept shell commands, file paths supplied for arbitrary writes, raw scripts, or unrestricted MSR addresses.
 
 Its responsibilities are:
 
@@ -89,9 +89,9 @@ Its responsibilities are:
 - verify values by reading them back;
 - restore an earlier snapshot;
 - maintain temporary-profile leases and restore settings when a lease expires;
-- optionally install an explicitly enabled persistent profile at boot.
+- reject new mutations until any recoverable interrupted session has been reconciled.
 
-PolicyKit authorization is requested only when a mutating transaction or persistent-profile operation requires it. Desktop environments may cache authorization for a short session according to their PolicyKit policy.
+PolicyKit authorization is requested only after a mutating transaction is reviewed and confirmed. The helper remains alive only for the temporary tuning session. Persistent boot-time application is outside the first Intel-tuning milestone.
 
 ### 5.3 Stress worker
 
@@ -138,7 +138,7 @@ The existing `main.go` and `gui.go` monolith is split into packages with narrow 
 `ProfileManager`
 
 - stores named profiles and their hardware compatibility metadata;
-- distinguishes temporary and persistent application;
+- distinguishes staged profiles from temporarily applied profiles;
 - supports import, export, comparison, and explicit reset to captured stock values.
 
 ### 6.2 Proposed source layout
@@ -146,7 +146,7 @@ The existing `main.go` and `gui.go` monolith is split into packages with narrow 
 ```text
 cmd/
   studio/                 unprivileged desktop entry point
-  helper/                 privileged D-Bus service entry point
+  helper/                 short-lived privileged session entry point
   stress-worker/          isolated workload process
 internal/
   app/                    application lifecycle and dependency wiring
@@ -156,13 +156,13 @@ internal/
   providers/intel/        RAPL, MSR, hybrid-core telemetry
   providers/nvidia/       optional NVIDIA telemetry adapter
   tuning/                 transactions, bounds, profiles, leases
-  privilege/              D-Bus protocol and PolicyKit integration
+  privilege/              typed helper protocol, pkexec client, and recovery
   stress/                 orchestration and engine adapters
   session/                recording and comparison
   report/                 JSON, CSV, and HTML export
   ui/                     Fyne pages, components, themes, and view models
 assets/                   icons, shaders, report templates, notices
-packaging/                PolicyKit, D-Bus, systemd, Arch, and bundle files
+packaging/                PolicyKit, desktop integration, Arch, and bundle files
 ```
 
 No package may bypass a core interface to write hardware controls directly.
@@ -223,7 +223,7 @@ The selected visual direction is **XTU Classic**: persistent left navigation, a 
 - **Monitor** — configurable live charts, per-core and per-device selection, pause, zoom, markers, and CSV export.
 - **Tune** — capability-driven grouped controls with staged changes, review, Apply, and Revert.
 - **Stress Tests** — workload builder, live safety state, phase progress, and emergency Stop.
-- **Profiles** — named profiles, compatibility, temporary/persistent behavior, import, and export.
+- **Profiles** — named profiles, compatibility, temporary application, import, and export.
 - **Reports** — experiment history, A/B comparison, and export.
 - **Hardware** — detected devices, providers, supported controls, driver state, and diagnostics.
 - **Logs** — user-readable events with expandable technical detail.
@@ -261,7 +261,7 @@ Profiles store semantic controls, units, and hardware compatibility constraints,
 
 Temporary application is the default. The GUI renews a helper-owned lease while the profile is active. The helper restores the pre-application snapshot after missed heartbeats, GUI termination, explicit Revert, test completion when requested, or session logout. Lease timing is conservative and independent of UI rendering.
 
-The recovery snapshot is persisted atomically so the helper can repair an interrupted transaction after its own restart. A reboot naturally clears volatile hardware controls; any setting marked persistent requires a separate explicit PolicyKit-authorized action.
+The recovery snapshot is persisted atomically so the next helper session can repair an interrupted transaction. A reboot naturally clears volatile hardware controls. Persistent boot-time application is not provided in the first Intel-tuning milestone.
 
 ### 9.3 Stress safety controller
 
@@ -361,7 +361,7 @@ A separate opt-in suite runs only on explicitly authorized local hardware. It be
 
 ## 14. Packaging and distribution
 
-Releases are offline-ready. The primary generic x86-64 artifact is a self-extracting installer containing all redistributable application-owned binaries, assets, worker engines, helper files, D-Bus service definition, PolicyKit policy, desktop integration, required notices, and an uninstaller. Installation invokes a graphical PolicyKit request once for system files.
+Releases are offline-ready. The primary generic x86-64 artifact is a self-extracting installer containing all redistributable application-owned binaries, assets, worker engines, helper files, PolicyKit policy, desktop integration, required notices, and an uninstaller. Installation invokes a graphical PolicyKit request once for system files.
 
 The release pipeline also produces an Arch/CachyOS `.pkg.tar.zst` first, followed by `.deb` and `.rpm` packages from the same pinned inputs. Distribution-specific packages may rely only on documented base-system and driver interfaces; they must not trigger application-controlled downloads after installation.
 
@@ -425,7 +425,7 @@ The first public release is complete when:
 
 - UI stack: Go + Fyne, not Wails or a Rust rewrite.
 - Visual structure: XTU Classic layout.
-- Privilege model: unprivileged GUI plus typed D-Bus/PolicyKit helper.
+- Privilege model: unprivileged GUI plus a typed, short-lived helper launched through `pkexec` after review.
 - Telemetry: asynchronous, batch-oriented, lazy, subscription-driven, and backpressured.
 - Default tuning behavior: temporary lease with automatic rollback.
 - CPU/RAM engine: packaged `stress-ng` adapter.
