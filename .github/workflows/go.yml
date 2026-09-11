@@ -29,6 +29,8 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     container: golang:1.26-bookworm
+    env:
+      GOFLAGS: -buildvcs=false
     steps:
       - uses: actions/checkout@v6
       - name: Install desktop build dependencies
