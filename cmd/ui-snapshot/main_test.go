@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2/test"
+
+	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
 )
 
@@ -49,6 +52,51 @@ func TestIntel275HXSnapshotPageWaitsForRenderedCompletedDiscovery(t *testing.T) 
 		t.Fatalf("Tune capability generation = %q, want %q", got, want)
 	}
 	assertIntel275HXSnapshotCapabilities(t, state.Capabilities.Capabilities)
+}
+
+func TestIntel275HXScenarioSupportsDocumentedStudioPages(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	for _, page := range []string{"overview", "monitor", "hardware"} {
+		t.Run(page, func(t *testing.T) {
+			snapshot, err := snapshotPage(page, "intel-275hx")
+			if err != nil {
+				t.Fatalf("create Intel 275HX %s snapshot page: %v", page, err)
+			}
+			defer snapshot.deactivate()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := snapshot.wait(ctx); err != nil {
+				t.Fatalf("wait for rendered Intel 275HX %s page: %v", page, err)
+			}
+			if snapshot.object == nil {
+				t.Fatal("snapshot page object is nil")
+			}
+		})
+	}
+}
+
+func TestIntel275HXTelemetrySnapshotWaitsForChartHistory(t *testing.T) {
+	provider := newIntel275HXTelemetrySnapshotProvider()
+	metricIDs := []telemetry.MetricID{"cpu.utilization"}
+	for range 2 {
+		if _, err := provider.Sample(context.Background(), metricIDs); err != nil {
+			t.Fatalf("sample telemetry: %v", err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := provider.wait(ctx); err == nil {
+		t.Fatal("snapshot became ready before it had chart history")
+	}
+	if _, err := provider.Sample(context.Background(), metricIDs); err != nil {
+		t.Fatalf("sample telemetry: %v", err)
+	}
+	if err := provider.wait(context.Background()); err != nil {
+		t.Fatalf("snapshot did not become ready with chart history: %v", err)
+	}
 }
 
 func assertIntel275HXSnapshotCapabilities(t *testing.T, reported []tuning.Capability) {

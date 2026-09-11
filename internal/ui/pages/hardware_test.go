@@ -1,12 +1,16 @@
 package pages
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
@@ -79,6 +83,31 @@ func TestHardwareRefreshLifecycleIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestHardwareSnapshotSummaryRendersWithoutHostDiscovery(t *testing.T) {
+	application := test.NewApp()
+	defer application.Quit()
+
+	page := NewHardwareWithSummary(product.Current("snapshot"), diagnosticsSource{}, telemetry.Catalog{}, HardwareSummary{
+		Machine:       "Studio validation workstation",
+		OS:            "Linux",
+		Kernel:        "Linux snapshot",
+		CPU:           "Intel Core Ultra 9 275HX",
+		CPUDetails:    []string{"24 cores · 24 logical processors"},
+		Graphics:      []string{"Intel Arc Graphics"},
+		Memory:        "32 GiB",
+		MemoryDetails: []string{"12 GiB used · 20 GiB available"},
+		Storage:       []string{"NVMe · 1.0 TiB"},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := page.WaitForSummary(ctx); err != nil {
+		t.Fatalf("wait for injected hardware summary: %v", err)
+	}
+	if got := hardwareSummaryText(page); !strings.Contains(got, "Intel Core Ultra 9 275HX") || !strings.Contains(got, "Studio validation workstation") {
+		t.Fatalf("rendered summary = %q", got)
+	}
+}
+
 func TestDiagnosticsJSONContainsInventoryWithoutHostPaths(t *testing.T) {
 	payload, err := diagnosticsJSON(product.Current("test"), telemetry.Catalog{
 		Metrics: []telemetry.Descriptor{{ID: "cpu.utilization", ProviderID: "linux.procstat", Unit: "%"}},
@@ -93,4 +122,33 @@ func TestDiagnosticsJSONContainsInventoryWithoutHostPaths(t *testing.T) {
 	if strings.Contains(text, "/home/") || strings.Contains(text, "HOME=") {
 		t.Fatalf("diagnostics leaked host data: %s", text)
 	}
+}
+
+func hardwareSummaryText(page *Hardware) string {
+	if len(page.summaryHost.Objects) != 1 {
+		return ""
+	}
+	scroll, ok := page.summaryHost.Objects[0].(*container.Scroll)
+	if !ok {
+		return ""
+	}
+	var text []string
+	var visit func(fyne.CanvasObject)
+	visit = func(object fyne.CanvasObject) {
+		switch item := object.(type) {
+		case *widget.Label:
+			text = append(text, item.Text)
+		case *widget.Card:
+			text = append(text, item.Title, item.Subtitle)
+			if item.Content != nil {
+				visit(item.Content)
+			}
+		case *fyne.Container:
+			for _, child := range item.Objects {
+				visit(child)
+			}
+		}
+	}
+	visit(scroll.Content)
+	return strings.Join(text, "\n")
 }

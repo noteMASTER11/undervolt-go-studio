@@ -9,11 +9,13 @@ import (
 	"image/png"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
 
+	"github.com/noteMASTER11/undervolt-go-studio/internal/hardware"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/product"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
@@ -79,10 +81,14 @@ type snapshotPageResult struct {
 
 func snapshotPage(page, scenario string) (*snapshotPageResult, error) {
 	if scenario == "intel-275hx" {
-		if page != "tune" {
-			return nil, fmt.Errorf("scenario %q only supports the Tune page", scenario)
+		switch page {
+		case "overview", "monitor", "hardware":
+			return intel275HXTelemetrySnapshotPage(page)
+		case "tune":
+			return intel275HXSnapshotPage(), nil
+		default:
+			return nil, fmt.Errorf("scenario %q does not support page %q", scenario, page)
 		}
-		return intel275HXSnapshotPage(), nil
 	}
 	if scenario != "" {
 		return nil, fmt.Errorf("unknown snapshot scenario %q", scenario)
@@ -100,6 +106,116 @@ func snapshotPage(page, scenario string) (*snapshotPageResult, error) {
 		deactivate: shell.Deactivate,
 		wait:       func(context.Context) error { return nil },
 	}, nil
+}
+
+func intel275HXTelemetrySnapshotPage(page string) (*snapshotPageResult, error) {
+	provider := newIntel275HXTelemetrySnapshotProvider()
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, telemetry.SchedulerOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	catalog, err := scheduler.Discover(ctx)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("discover Intel 275HX snapshot telemetry: %w", err)
+	}
+	shell := ui.NewShellWithHardwareSummary(product.Current("snapshot"), scheduler, intel275HXHardwareSummary())
+	shell.SetCatalog(catalog)
+	shell.SetStatus("Intel Core Ultra 9 275HX · deterministic preview")
+	if err := shell.Select(page); err != nil {
+		cancel()
+		shell.Deactivate()
+		return nil, err
+	}
+	scheduler.Start(ctx)
+	return &snapshotPageResult{
+		object: shell.Object(),
+		deactivate: func() {
+			cancel()
+			shell.Deactivate()
+		},
+		wait: func(waitCtx context.Context) error {
+			if page == "hardware" {
+				if err := shell.WaitForHardwareSummary(waitCtx); err != nil {
+					return fmt.Errorf("wait for Intel 275HX hardware summary: %w", err)
+				}
+			} else {
+				if err := provider.wait(waitCtx); err != nil {
+					return err
+				}
+			}
+			fyne.DoAndWait(func() {})
+			return nil
+		},
+	}, nil
+}
+
+func intel275HXHardwareSummary() pages.HardwareSummary {
+	return pages.HardwareSummary{
+		Machine:       "Studio validation workstation",
+		OS:            "Linux",
+		Kernel:        "Linux snapshot",
+		CPU:           "Intel Core Ultra 9 275HX",
+		CPUDetails:    []string{"24 cores · 24 logical processors"},
+		Graphics:      []string{"Intel Arc Graphics"},
+		Memory:        "32 GiB",
+		MemoryDetails: []string{"12 GiB used · 20 GiB available"},
+		Storage:       []string{"NVMe · 1.0 TiB"},
+	}
+}
+
+type intel275HXTelemetrySnapshotProvider struct {
+	sampled chan struct{}
+	once    sync.Once
+	samples atomic.Int32
+}
+
+func newIntel275HXTelemetrySnapshotProvider() *intel275HXTelemetrySnapshotProvider {
+	return &intel275HXTelemetrySnapshotProvider{sampled: make(chan struct{})}
+}
+
+func (p *intel275HXTelemetrySnapshotProvider) ID() string { return "intel-275hx-snapshot" }
+
+func (p *intel275HXTelemetrySnapshotProvider) Discover(context.Context) (telemetry.Catalog, error) {
+	cpuID := hardware.NewDeviceID(hardware.KindCPU, "Intel", "core-ultra-9-275hx")
+	gpuID := hardware.NewDeviceID(hardware.KindGPU, "Intel", "arc-graphics")
+	return telemetry.Catalog{
+		Devices: []hardware.Device{
+			{ID: cpuID, Kind: hardware.KindCPU, Vendor: "Intel", Name: "Core Ultra 9 275HX"},
+			{ID: gpuID, Kind: hardware.KindGPU, Vendor: "Intel", Name: "Arc Graphics"},
+		},
+		Metrics: []telemetry.Descriptor{
+			{ID: "cpu.utilization", ProviderID: p.ID(), DeviceID: cpuID, Label: "CPU Utilization", Unit: "%", MinInterval: 100 * time.Millisecond},
+			{ID: "cpu.package.temperature", ProviderID: p.ID(), DeviceID: cpuID, Label: "CPU Package Temperature", Unit: "°C", MinInterval: 100 * time.Millisecond},
+			{ID: "cpu.pcore.frequency", ProviderID: p.ID(), DeviceID: cpuID, Label: "P-core Frequency", Unit: "MHz", MinInterval: 100 * time.Millisecond},
+			{ID: "cpu.ecore.frequency", ProviderID: p.ID(), DeviceID: cpuID, Label: "E-core Frequency", Unit: "MHz", MinInterval: 100 * time.Millisecond},
+		},
+	}, nil
+}
+
+func (p *intel275HXTelemetrySnapshotProvider) Sample(_ context.Context, metricIDs []telemetry.MetricID) (telemetry.Frame, error) {
+	now := time.Now()
+	values := map[telemetry.MetricID]float64{
+		"cpu.utilization":         37.0,
+		"cpu.package.temperature": 71.0,
+		"cpu.pcore.frequency":     4380.0,
+		"cpu.ecore.frequency":     3520.0,
+	}
+	samples := make([]telemetry.Sample, 0, len(metricIDs))
+	for _, metricID := range metricIDs {
+		samples = append(samples, telemetry.Sample{MetricID: metricID, Value: values[metricID], Timestamp: now, Quality: telemetry.QualityGood})
+	}
+	if p.samples.Add(1) >= 3 {
+		p.once.Do(func() { close(p.sampled) })
+	}
+	return telemetry.Frame{ProviderID: p.ID(), StartedAt: now, FinishedAt: now, Samples: samples}, nil
+}
+
+func (p *intel275HXTelemetrySnapshotProvider) wait(ctx context.Context) error {
+	select {
+	case <-p.sampled:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for Intel 275HX telemetry sample: %w", ctx.Err())
+	}
 }
 
 func intel275HXSnapshotPage() *snapshotPageResult {

@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
@@ -25,11 +27,31 @@ type Shell struct {
 	root      fyne.CanvasObject
 
 	statusLabel *widget.Label
+	hardware    *pages.Hardware
 }
 
 func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 	eventStore := events.NewStore(0)
 	return newShell(info, scheduler, eventStore, newDesktopTuneService(info.Version, eventStore), fyne.Do)
+}
+
+// NewShellWithHardwareSummary creates a shell whose Hardware page displays a
+// supplied summary. It supports deterministic headless documentation views.
+func NewShellWithHardwareSummary(info product.Info, scheduler *telemetry.Scheduler, summary pages.HardwareSummary) *Shell {
+	eventStore := events.NewStore(0)
+	shell := newShell(info, scheduler, eventStore, newDesktopTuneService(info.Version, eventStore), fyne.Do)
+	for index, factory := range shell.navigator.factories {
+		if factory.ID != "hardware" {
+			continue
+		}
+		shell.navigator.factories[index].Create = func() Page {
+			shell.hardware = pages.NewHardwareWithSummary(info, scheduler, shell.catalog, summary)
+			return shell.hardware
+		}
+		shell.navigator.byID["hardware"] = shell.navigator.factories[index]
+		break
+	}
+	return shell
 }
 
 func newShell(info product.Info, scheduler *telemetry.Scheduler, eventStore *events.Store, tuneService viewmodel.TuneService, dispatch func(func())) *Shell {
@@ -115,6 +137,14 @@ func (s *Shell) CloseTune() error {
 		return nil
 	}
 	return s.tune.Close()
+}
+
+// WaitForHardwareSummary waits for the selected Hardware page to render its summary.
+func (s *Shell) WaitForHardwareSummary(ctx context.Context) error {
+	if s.hardware == nil {
+		return errors.New("hardware page is not selected")
+	}
+	return s.hardware.WaitForSummary(ctx)
 }
 
 func placeholderFactory(id, label string, icon fyne.Resource, message string) PageFactory {

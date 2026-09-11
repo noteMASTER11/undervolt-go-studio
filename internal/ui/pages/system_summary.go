@@ -18,19 +18,7 @@ import (
 	"github.com/noteMASTER11/undervolt-go-studio/internal/telemetry"
 )
 
-type hardwareOverview struct {
-	Machine       string
-	OS            string
-	Kernel        string
-	CPU           string
-	CPUDetails    []string
-	Graphics      []string
-	Memory        string
-	MemoryDetails []string
-	Storage       []string
-}
-
-func readHardwareOverview(ctx context.Context, catalog telemetry.Catalog) hardwareOverview {
+func readHardwareOverview(ctx context.Context, catalog telemetry.Catalog) HardwareSummary {
 	physicalCores, logicalCPUs := cpuTopology("/sys/devices/system/cpu")
 	if logicalCPUs == 0 {
 		logicalCPUs = runtime.NumCPU()
@@ -48,7 +36,7 @@ func readHardwareOverview(ctx context.Context, catalog telemetry.Catalog) hardwa
 		memoryDetails = []string{fmt.Sprintf("%s used · %s available", humanBytes(usedMemory), humanBytes(availableMemory))}
 	}
 
-	overview := hardwareOverview{
+	overview := HardwareSummary{
 		Machine:       machineName("/sys/class/dmi/id"),
 		OS:            operatingSystemName("/etc/os-release"),
 		Kernel:        kernelName(),

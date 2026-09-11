@@ -191,10 +191,14 @@ func overviewChartLayout(charts []fyne.CanvasObject) fyne.CanvasObject {
 	case 1:
 		return charts[0]
 	case 2:
-		return container.NewGridWithColumns(2, charts...)
+		return container.NewGridWithColumns(2, overviewChartCell(charts[0]), overviewChartCell(charts[1]))
 	default:
-		return container.NewGridWithRows(2, container.NewGridWithColumns(2, charts[0], charts[1]), charts[2])
+		return container.NewGridWithRows(3, charts...)
 	}
+}
+
+func overviewChartCell(chart fyne.CanvasObject) fyne.CanvasObject {
+	return container.NewPadded(chart)
 }
 
 func averageSample(samples map[telemetry.MetricID]telemetry.Sample, metricIDs []telemetry.MetricID) (telemetry.Sample, bool) {
