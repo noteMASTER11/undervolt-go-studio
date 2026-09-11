@@ -47,7 +47,7 @@ func (h *Handle) Close() {
 type subscriptionEntry struct {
 	subscription Subscription
 	metricSet    map[MetricID]struct{}
-	lastDelivery map[string]time.Time
+	lastDelivery map[MetricID]time.Time
 	handle       *Handle
 }
 
@@ -283,7 +283,7 @@ func (s *Scheduler) Subscribe(subscription Subscription) *Handle {
 	}
 	s.subscriptions[id] = &subscriptionEntry{
 		subscription: subscription, metricSet: metricSet,
-		lastDelivery: make(map[string]time.Time), handle: handle,
+		lastDelivery: make(map[MetricID]time.Time), handle: handle,
 	}
 	s.notifyWorkersLocked()
 	s.mu.Unlock()
@@ -412,20 +412,20 @@ func (s *Scheduler) publish(runtime *providerRuntime, frame Frame) {
 		deliveryTime = time.Now()
 	}
 	for _, entry := range s.subscriptions {
-		if last := entry.lastDelivery[runtime.provider.ID()]; !last.IsZero() && deliveryTime.Sub(last) < entry.subscription.Interval {
-			continue
-		}
 		filtered := frame
 		filtered.Samples = make([]Sample, 0, len(frame.Samples))
 		for _, sample := range frame.Samples {
 			if _, requested := entry.metricSet[sample.MetricID]; requested {
-				filtered.Samples = append(filtered.Samples, sample)
+				last := entry.lastDelivery[sample.MetricID]
+				if last.IsZero() || deliveryTime.Sub(last) >= entry.subscription.Interval {
+					filtered.Samples = append(filtered.Samples, sample)
+					entry.lastDelivery[sample.MetricID] = deliveryTime
+				}
 			}
 		}
 		if len(filtered.Samples) == 0 {
 			continue
 		}
-		entry.lastDelivery[runtime.provider.ID()] = deliveryTime
 		if deliverLatest(entry.handle.frames, filtered) {
 			runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.DroppedFrames++ })
 		}
