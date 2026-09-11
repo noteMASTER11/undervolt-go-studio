@@ -1,12 +1,177 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning/intel"
 )
+
+func TestEmitReportCreatesMissingOutputParent(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "reports", "smoke", "report.json")
+	report := smokeReport{Mode: "read-only"}
+
+	if err := emitReport(io.Discard, output, report); err != nil {
+		t.Fatalf("emit report: %v", err)
+	}
+	encoded, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte(`"mode": "read-only"`)) {
+		t.Fatalf("report=%s", encoded)
+	}
+}
+
+func TestCaseValueMapsRequireEveryRequestedControl(t *testing.T) {
+	changes := []tuning.Change{
+		{ID: tuning.ControlPL1, Requested: tuning.NumericValue(44)},
+		{ID: tuning.ControlPL2, Requested: tuning.NumericValue(55)},
+	}
+	complete := map[tuning.ControlID]tuning.Value{
+		tuning.ControlPL1: tuning.NumericValue(44),
+		tuning.ControlPL2: tuning.NumericValue(55),
+	}
+	for _, phase := range []string{"stock", "effective", "restored"} {
+		if err := requireValuesForChanges(phase, complete, changes); err != nil {
+			t.Fatalf("%s map rejected: %v", phase, err)
+		}
+		incomplete := map[tuning.ControlID]tuning.Value{tuning.ControlPL1: tuning.NumericValue(44)}
+		err := requireValuesForChanges(phase, incomplete, changes)
+		if err == nil || !strings.Contains(err.Error(), string(tuning.ControlPL2)) {
+			t.Fatalf("%s missing control err=%v", phase, err)
+		}
+	}
+}
+
+func TestRecoveryFailurePersistsReportBeforeMutation(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "reports", "recovery.json")
+	recoveryErr := errors.New("unresolved prior transaction")
+	engine := tuning.NewEngine(tuning.CapabilitySet{MachineID: "test-machine"}, recoveryFailureStore{err: recoveryErr})
+	report := smokeReport{Mode: "conservative-mutation"}
+
+	err := recoverBeforeMutation(context.Background(), engine, &report, output)
+	if !errors.Is(err, recoveryErr) {
+		t.Fatalf("recovery error=%v", err)
+	}
+	encoded, readErr := os.ReadFile(output)
+	if readErr != nil {
+		t.Fatalf("read recovery report: %v", readErr)
+	}
+	var saved smokeReport
+	if err := json.Unmarshal(encoded, &saved); err != nil {
+		t.Fatalf("decode recovery report: %v", err)
+	}
+	if !strings.Contains(saved.RecoveryError, recoveryErr.Error()) {
+		t.Fatalf("recovery error was not persisted: %+v", saved)
+	}
+}
+
+func TestExerciseCaseDefersRollbackAfterApplyPanic(t *testing.T) {
+	driver := &exerciseCaseTestDriver{}
+	capabilities := exerciseCaseTestCapabilities(driver.ID())
+	engine := tuning.NewEngine(capabilities, &exerciseCaseRecoveryStore{}, driver)
+	candidate := smokeCase{Name: "power", Changes: []tuning.Change{{ID: tuning.ControlPL1, Requested: tuning.NumericValue(43)}}}
+
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("rediscovery panic was not propagated")
+		}
+		if driver.restores != 1 {
+			t.Fatalf("restores=%d, want one deferred rollback", driver.restores)
+		}
+	}()
+	exerciseCaseWithRediscovery(context.Background(), candidate, capabilities, engine, func(context.Context) (tuning.CapabilitySet, error) {
+		panic("rediscovery failed unexpectedly")
+	})
+}
+
+func TestExerciseCaseRollsBackOnlyOnceAfterExplicitRestore(t *testing.T) {
+	driver := &exerciseCaseTestDriver{}
+	capabilities := exerciseCaseTestCapabilities(driver.ID())
+	engine := tuning.NewEngine(capabilities, &exerciseCaseRecoveryStore{}, driver)
+	candidate := smokeCase{Name: "power", Changes: []tuning.Change{{ID: tuning.ControlPL1, Requested: tuning.NumericValue(43)}}}
+	result := exerciseCaseWithRediscovery(context.Background(), candidate, capabilities, engine, func(context.Context) (tuning.CapabilitySet, error) {
+		return capabilities, nil
+	})
+	if result.Error != "" {
+		t.Fatalf("exercise case: %s", result.Error)
+	}
+	if driver.restores != 1 {
+		t.Fatalf("restores=%d, want one explicit rollback", driver.restores)
+	}
+}
+
+type recoveryFailureStore struct{ err error }
+
+func (store recoveryFailureStore) Load() (tuning.RecoveryRecord, error) {
+	return tuning.RecoveryRecord{}, store.err
+}
+func (recoveryFailureStore) Save(tuning.RecoveryRecord) error { return nil }
+func (recoveryFailureStore) Remove() error                    { return nil }
+
+type exerciseCaseRecoveryStore struct{}
+
+func (*exerciseCaseRecoveryStore) Load() (tuning.RecoveryRecord, error) {
+	return tuning.RecoveryRecord{}, os.ErrNotExist
+}
+func (*exerciseCaseRecoveryStore) Save(tuning.RecoveryRecord) error { return nil }
+func (*exerciseCaseRecoveryStore) Remove() error                    { return nil }
+
+type exerciseCaseTestDriver struct{ restores int }
+
+func (*exerciseCaseTestDriver) ID() string { return "test-driver" }
+func (*exerciseCaseTestDriver) Probe(context.Context) ([]tuning.Capability, error) {
+	return nil, nil
+}
+func (driver *exerciseCaseTestDriver) Prepare(_ context.Context, change tuning.Change) (tuning.PreparedOperation, error) {
+	return &exerciseCaseTestOperation{driver: driver, change: change}, nil
+}
+func (*exerciseCaseTestDriver) Restore(context.Context, tuning.ControlID, json.RawMessage) (tuning.Value, error) {
+	return tuning.NumericValue(44), nil
+}
+
+type exerciseCaseTestOperation struct {
+	driver *exerciseCaseTestDriver
+	change tuning.Change
+}
+
+func (operation *exerciseCaseTestOperation) ControlID() tuning.ControlID { return operation.change.ID }
+func (*exerciseCaseTestOperation) DriverID() string                      { return "test-driver" }
+func (*exerciseCaseTestOperation) Order() int                            { return tuning.OrderPower }
+func (*exerciseCaseTestOperation) Capture(context.Context) (json.RawMessage, error) {
+	return json.RawMessage(`44`), nil
+}
+func (operation *exerciseCaseTestOperation) Apply(context.Context) (tuning.Value, error) {
+	return operation.change.Requested, nil
+}
+func (operation *exerciseCaseTestOperation) Restore(context.Context, json.RawMessage) (tuning.Value, error) {
+	operation.driver.restores++
+	return tuning.NumericValue(44), nil
+}
+
+func exerciseCaseTestCapabilities(driverID string) tuning.CapabilitySet {
+	return tuning.CapabilitySet{
+		Generation: "test-generation",
+		MachineID:  "test-machine",
+		Capabilities: []tuning.Capability{{
+			ID:       tuning.ControlPL1,
+			DriverID: driverID,
+			State:    tuning.StateSupported,
+			Unit:     tuning.UnitWatt,
+			Current:  tuning.NumericValue(44),
+			Range:    &tuning.NumericRange{Minimum: 15, Maximum: 55, Step: 1},
+		}},
+	}
+}
 
 func TestMutatingSmokeRequiresExactConfirmation(t *testing.T) {
 	identity := intel.Identity{Vendor: "GenuineIntel", Family: 6, Model: 0xc6, Stepping: 2}

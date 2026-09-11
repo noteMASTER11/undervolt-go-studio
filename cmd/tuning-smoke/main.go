@@ -64,6 +64,7 @@ type smokeReport struct {
 	TopologyError string               `json:"topology_error,omitempty"`
 	Capabilities  tuning.CapabilitySet `json:"capabilities"`
 	ProbeError    string               `json:"probe_error,omitempty"`
+	RecoveryError string               `json:"recovery_error,omitempty"`
 	Cases         []caseReport         `json:"cases,omitempty"`
 }
 
@@ -101,9 +102,8 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 	drivers := systemDrivers(store, identity, topology)
 	machineID := fmt.Sprintf("%s-%d-%x-%d", identity.Vendor, identity.Family, identity.Model, identity.Stepping)
 	discoverer := tuning.NewDiscoverer(machineID, drivers...)
-	capabilities, probeErr := discover(context.Background(), discoverer)
 	report := smokeReport{
-		CreatedAt: time.Now(), Identity: identity, Topology: topology, Capabilities: capabilities,
+		CreatedAt: time.Now(), Identity: identity, Topology: topology,
 	}
 	if config.Mutate {
 		report.Mode = "conservative-mutation"
@@ -113,6 +113,20 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 	if topologyErr != nil {
 		report.TopologyError = topologyErr.Error()
 	}
+	var engine *tuning.Engine
+	if config.Mutate {
+		bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+		if err != nil {
+			return fmt.Errorf("read boot ID: %w", err)
+		}
+		engine = tuning.NewEngine(tuning.CapabilitySet{MachineID: machineID}, tuning.FileRecoveryStore{}, drivers...)
+		engine.BootID = strings.TrimSpace(string(bootID))
+		if err := recoverBeforeMutation(context.Background(), engine, &report, config.Output); err != nil {
+			return err
+		}
+	}
+	capabilities, probeErr := discover(context.Background(), discoverer)
+	report.Capabilities = capabilities
 	if probeErr != nil {
 		report.ProbeError = probeErr.Error()
 	}
@@ -131,13 +145,7 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 	if !config.Mutate {
 		return nil
 	}
-
-	bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if err != nil {
-		return fmt.Errorf("read boot ID: %w", err)
-	}
-	engine := tuning.NewEngine(capabilities, tuning.FileRecoveryStore{}, drivers...)
-	engine.BootID = strings.TrimSpace(string(bootID))
+	engine.Capabilities = capabilities
 	for _, candidate := range conservativeCases(capabilities) {
 		result := exerciseCase(context.Background(), candidate, capabilities, engine, discoverer)
 		report.Cases = append(report.Cases, result)
@@ -149,6 +157,17 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 		}
 	}
 	return emitReport(stdout, config.Output, report)
+}
+
+func recoverBeforeMutation(ctx context.Context, engine *tuning.Engine, report *smokeReport, output string) error {
+	if _, err := engine.Recover(ctx); err != nil {
+		report.RecoveryError = err.Error()
+		if reportErr := emitReport(io.Discard, output, *report); reportErr != nil {
+			return errors.Join(fmt.Errorf("recover previous mutation: %w", err), fmt.Errorf("persist recovery failure report: %w", reportErr))
+		}
+		return fmt.Errorf("recover previous mutation: %w", err)
+	}
+	return nil
 }
 
 func validateMutationGate(mutate bool, confirmation string, identity intel.Identity) error {
@@ -270,7 +289,17 @@ func lowerNumeric(capability tuning.Capability, amount float64) float64 {
 }
 
 func exerciseCase(ctx context.Context, candidate smokeCase, capabilities tuning.CapabilitySet, engine *tuning.Engine, discoverer *tuning.Discoverer) caseReport {
-	result := caseReport{Name: candidate.Name, Stock: valuesForChanges(capabilities, candidate.Changes), Requested: requestedValues(candidate.Changes)}
+	return exerciseCaseWithRediscovery(ctx, candidate, capabilities, engine, func(ctx context.Context) (tuning.CapabilitySet, error) {
+		return discover(ctx, discoverer)
+	})
+}
+
+func exerciseCaseWithRediscovery(ctx context.Context, candidate smokeCase, capabilities tuning.CapabilitySet, engine *tuning.Engine, rediscover func(context.Context) (tuning.CapabilitySet, error)) (result caseReport) {
+	result = caseReport{Name: candidate.Name, Stock: valuesForChanges(capabilities, candidate.Changes), Requested: requestedValues(candidate.Changes)}
+	if err := requireValuesForChanges("stock", result.Stock, candidate.Changes); err != nil {
+		result.Error = err.Error()
+		return result
+	}
 	changeSet := tuning.ChangeSet{Generation: capabilities.Generation, MachineID: capabilities.MachineID, Changes: candidate.Changes}
 	result.Events = append(result.Events, tuning.Event{Time: time.Now(), Kind: "applying", Message: "Capturing stock state and applying temporary smoke-test values"})
 	active, _, err := engine.Apply(ctx, changeSet)
@@ -279,17 +308,30 @@ func exerciseCase(ctx context.Context, candidate smokeCase, capabilities tuning.
 		result.Events = append(result.Events, tuning.Event{Time: time.Now(), Kind: "failed", Message: "Apply failed", Detail: err.Error()})
 		return result
 	}
+	rollbackAttempted := false
+	var rollbackErr error
+	rollback := func() error {
+		if rollbackAttempted {
+			return rollbackErr
+		}
+		rollbackAttempted = true
+		rollbackErr = active.Rollback(context.WithoutCancel(ctx))
+		return rollbackErr
+	}
+	defer func() { _ = rollback() }()
 	result.Events = append(result.Events, tuning.Event{Time: time.Now(), Kind: "applied", Message: "Temporary values applied with verified read-back"})
-	effectiveSet, effectiveErr := discover(ctx, discoverer)
+	effectiveSet, effectiveErr := rediscover(ctx)
 	result.Effective = valuesForChanges(effectiveSet, candidate.Changes)
-	rollbackErr := active.Rollback(context.WithoutCancel(ctx))
+	effectiveErr = errors.Join(effectiveErr, requireValuesForChanges("effective", result.Effective, candidate.Changes))
+	rollbackErr = rollback()
 	if rollbackErr == nil {
 		result.Events = append(result.Events, tuning.Event{Time: time.Now(), Kind: "restored", Message: "Stock values restored"})
 	} else {
 		result.Events = append(result.Events, tuning.Event{Time: time.Now(), Kind: "rollback_incomplete", Message: "Stock restore failed", Detail: rollbackErr.Error()})
 	}
-	restoredSet, restoredErr := discover(context.WithoutCancel(ctx), discoverer)
+	restoredSet, restoredErr := rediscover(context.WithoutCancel(ctx))
 	result.Restored = valuesForChanges(restoredSet, candidate.Changes)
+	restoredErr = errors.Join(restoredErr, requireValuesForChanges("restored", result.Restored, candidate.Changes))
 	restoreVerifyErr := verifyRestored(result.Stock, result.Restored)
 	if err := errors.Join(effectiveErr, rollbackErr, restoredErr, restoreVerifyErr); err != nil {
 		result.Error = err.Error()
@@ -317,6 +359,15 @@ func requestedValues(changes []tuning.Change) map[tuning.ControlID]tuning.Value 
 		values[change.ID] = change.Requested
 	}
 	return values
+}
+
+func requireValuesForChanges(phase string, values map[tuning.ControlID]tuning.Value, changes []tuning.Change) error {
+	for _, change := range changes {
+		if _, ok := values[change.ID]; !ok {
+			return fmt.Errorf("%s rediscovery: %s is missing", phase, change.ID)
+		}
+	}
+	return nil
 }
 
 func verifyRestored(stock, restored map[tuning.ControlID]tuning.Value) error {
@@ -368,6 +419,9 @@ func emitReport(stdout io.Writer, output string, report smokeReport) error {
 		return nil
 	}
 	directory := filepath.Dir(output)
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return fmt.Errorf("create report directory: %w", err)
+	}
 	temporary, err := os.CreateTemp(directory, ".tuning-smoke-*")
 	if err != nil {
 		return err
