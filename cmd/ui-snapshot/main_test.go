@@ -31,11 +31,13 @@ func TestIntel275HXSnapshotServiceReportsRequiredCapabilitiesHonestly(t *testing
 }
 
 func TestIntel275HXSnapshotPageWaitsForRenderedCompletedDiscovery(t *testing.T) {
-	snapshot, err := snapshotPage("tune", "intel-275hx")
+	application := test.NewApp()
+	defer application.Quit()
+	snapshot, err := createSnapshotPage("tune", "intel-275hx")
 	if err != nil {
 		t.Fatalf("create Intel 275HX snapshot page: %v", err)
 	}
-	defer snapshot.deactivate()
+	defer stopSnapshot(snapshot)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -61,11 +63,11 @@ func TestIntel275HXScenarioSupportsDocumentedStudioPages(t *testing.T) {
 
 	for _, page := range []string{"overview", "monitor", "hardware"} {
 		t.Run(page, func(t *testing.T) {
-			snapshot, err := snapshotPage(page, "intel-275hx")
+			snapshot, err := createSnapshotPage(page, "intel-275hx")
 			if err != nil {
 				t.Fatalf("create Intel 275HX %s snapshot page: %v", page, err)
 			}
-			defer snapshot.deactivate()
+			defer stopSnapshot(snapshot)
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()

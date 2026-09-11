@@ -67,13 +67,17 @@ type Hardware struct {
 }
 
 func NewHardware(info product.Info, source HardwareSource, catalog telemetry.Catalog) *Hardware {
-	return newHardware(info, source, catalog, readHardwareOverview)
+	page := newHardware(info, source, catalog, readHardwareOverview)
+	page.SetCatalog(catalog)
+	return page
 }
 
 // NewHardwareWithSummary creates a Hardware page that displays a supplied,
 // verified summary. It is used by deterministic headless documentation views.
 func NewHardwareWithSummary(info product.Info, source HardwareSource, catalog telemetry.Catalog, summary HardwareSummary) *Hardware {
-	return newHardware(info, source, catalog, func(context.Context, telemetry.Catalog) HardwareSummary { return summary })
+	page := newHardware(info, source, catalog, func(context.Context, telemetry.Catalog) HardwareSummary { return summary })
+	page.setSummary(summary)
+	return page
 }
 
 func newHardware(info product.Info, source HardwareSource, catalog telemetry.Catalog, summary func(context.Context, telemetry.Catalog) HardwareSummary) *Hardware {
@@ -87,9 +91,19 @@ func newHardware(info product.Info, source HardwareSource, catalog telemetry.Cat
 		page.status,
 	))
 	page.root = container.NewPadded(container.NewBorder(header, nil, nil, nil, page.summaryHost))
-	page.SetCatalog(catalog)
 	page.setDiagnostics(source.Diagnostics())
 	return page
+}
+
+func (p *Hardware) setSummary(summary HardwareSummary) {
+	ready := make(chan struct{})
+	p.summaryHost.Objects = []fyne.CanvasObject{hardwareOverviewObject(summary)}
+	p.summaryHost.Refresh()
+	p.mu.Lock()
+	p.summaryReady = ready
+	p.summaryLoaded = true
+	p.mu.Unlock()
+	close(ready)
 }
 
 func hardwareOverviewObject(overview HardwareSummary) fyne.CanvasObject {

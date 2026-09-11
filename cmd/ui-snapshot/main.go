@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image"
 	"image/png"
 	"os"
 	"sync"
@@ -43,26 +44,36 @@ func render(page, scenario, output string, width, height int) error {
 	defer application.Quit()
 	application.Settings().SetTheme(ui.StudioTheme())
 
-	snapshot, err := snapshotPage(page, scenario)
+	snapshot, err := createSnapshotPage(page, scenario)
 	if err != nil {
 		return err
 	}
-	defer snapshot.deactivate()
-
-	window := test.NewWindow(snapshot.object)
-	defer window.Close()
-	window.Resize(fyne.NewSize(float32(width), float32(height)))
+	var deactivateOnce sync.Once
+	deactivate := func() { deactivateOnce.Do(func() { stopSnapshot(snapshot) }) }
+	defer deactivate()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := snapshot.wait(ctx); err != nil {
 		return err
 	}
+	// Freeze all snapshot sources before the test canvas builds widget
+	// renderers. Otherwise a discovery callback can mutate RichText caches
+	// concurrently with NewWindow or Capture.
+	deactivate()
+
+	var captured image.Image
+	fyne.DoAndWait(func() {
+		window := test.NewWindow(snapshot.object)
+		defer window.Close()
+		window.Resize(fyne.NewSize(float32(width), float32(height)))
+		captured = window.Canvas().Capture()
+	})
 
 	file, err := os.Create(output)
 	if err != nil {
 		return err
 	}
-	if err := png.Encode(file, window.Canvas().Capture()); err != nil {
+	if err := png.Encode(file, captured); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -70,6 +81,19 @@ func render(page, scenario, output string, width, height int) error {
 		return err
 	}
 	return nil
+}
+
+func createSnapshotPage(page, scenario string) (*snapshotPageResult, error) {
+	var snapshot *snapshotPageResult
+	var err error
+	fyne.DoAndWait(func() { snapshot, err = snapshotPage(page, scenario) })
+	return snapshot, err
+}
+
+func stopSnapshot(snapshot *snapshotPageResult) {
+	fyne.DoAndWait(snapshot.deactivate)
+	// Drain callbacks that were queued before the dispatchers were cancelled.
+	fyne.DoAndWait(func() {})
 }
 
 type snapshotPageResult struct {
