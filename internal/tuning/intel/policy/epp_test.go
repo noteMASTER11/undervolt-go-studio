@@ -89,6 +89,80 @@ func TestEPPIsKernelBlockedByIntelPstatePerformanceGovernor(t *testing.T) {
 	}
 }
 
+func TestEPPFailsClosedWhenPolicyStateCannotBeRead(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance balance_power power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+	})
+	store.Fail("read", eppRoot+"/policy0/scaling_governor", errors.New("permission denied"))
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" || capability.Reason == "" {
+		t.Fatalf("unverified-policy capability = %+v", capability)
+	}
+}
+
+func TestEPPDetectsPerformanceGovernorBeforeSkippingUnreadablePreference(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+		"policy8/energy_performance_available_preferences": "default performance power\n",
+		"policy8/energy_performance_preference":            "default\n",
+		"policy8/scaling_driver":                           "intel_pstate\n",
+		"policy8/scaling_governor":                         "performance\n",
+	})
+	store.Fail("read", eppRoot+"/policy8/energy_performance_preference", errors.New("permission denied"))
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "intel_pstate_performance_governor" {
+		t.Fatalf("mixed-policy capability = %+v", capability)
+	}
+}
+
+func TestEPPFailsClosedWhenAnyPolicyPreferenceCannotBeRead(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+		"policy8/energy_performance_available_preferences": "default performance power\n",
+		"policy8/energy_performance_preference":            "default\n",
+		"policy8/scaling_driver":                           "intel_pstate\n",
+		"policy8/scaling_governor":                         "powersave\n",
+	})
+	store.Fail("read", eppRoot+"/policy8/energy_performance_preference", errors.New("permission denied"))
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" {
+		t.Fatalf("partial-policy capability = %+v", capability)
+	}
+}
+
 func TestEPPRestoreAcceptsAlreadyRestoredValueWhenKernelRejectsWrites(t *testing.T) {
 	const preferencePath = eppRoot + "/policy0/energy_performance_preference"
 	store := eppStore(map[string]string{
@@ -114,6 +188,98 @@ func TestEPPRestoreAcceptsAlreadyRestoredValueWhenKernelRejectsWrites(t *testing
 	if len(store.Writes) != 0 {
 		t.Fatalf("already-restored value caused %d writes", len(store.Writes))
 	}
+}
+
+func TestEPPApplySkipsWriteWhenRequestedValueIsAlreadyEffective(t *testing.T) {
+	const preferencePath = eppRoot + "/policy0/energy_performance_preference"
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+	})
+	driver := New(store)
+	if _, err := driver.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	op, err := driver.Prepare(context.Background(), tuning.Change{ID: tuning.ControlEPP, Requested: tuning.ChoiceValue("default")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Capture(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.Fail("write", preferencePath, errors.New("device or resource busy"))
+	if _, err := op.Apply(context.Background()); err != nil {
+		t.Fatalf("idempotent apply attempted a write: %v", err)
+	}
+	if len(store.Writes) != 0 {
+		t.Fatalf("idempotent apply caused %d writes", len(store.Writes))
+	}
+}
+
+func TestWriteChoiceFailsOnEveryUnverifiedPath(t *testing.T) {
+	const preferencePath = eppRoot + "/policy0/energy_performance_preference"
+	tests := []struct {
+		name           string
+		configure      func(*scriptedChoiceStore)
+		wantWriteCount int
+	}{
+		{
+			name: "initial read",
+			configure: func(store *scriptedChoiceStore) {
+				store.failReadAt = 1
+			},
+		},
+		{
+			name: "changed-value write",
+			configure: func(store *scriptedChoiceStore) {
+				store.Fail("write", preferencePath, errors.New("device or resource busy"))
+			},
+		},
+		{
+			name: "post-write read",
+			configure: func(store *scriptedChoiceStore) {
+				store.failReadAt = 2
+			},
+			wantWriteCount: 1,
+		},
+		{
+			name: "read-back mismatch",
+			configure: func(store *scriptedChoiceStore) {
+				store.secondRead = []byte("balance_power\n")
+			},
+			wantWriteCount: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &scriptedChoiceStore{MemoryStore: testkit.NewMemoryStore(map[string]string{preferencePath: "default\n"})}
+			test.configure(store)
+			if err := writeChoice(store, preferencePath, "power"); err == nil {
+				t.Fatal("unverified choice was accepted")
+			}
+			if len(store.Writes) != test.wantWriteCount {
+				t.Fatalf("writes = %d, want %d", len(store.Writes), test.wantWriteCount)
+			}
+		})
+	}
+}
+
+type scriptedChoiceStore struct {
+	*testkit.MemoryStore
+	readCount  int
+	failReadAt int
+	secondRead []byte
+}
+
+func (store *scriptedChoiceStore) Read(path string) ([]byte, error) {
+	store.readCount++
+	if store.readCount == store.failReadAt {
+		return nil, errors.New("read failed")
+	}
+	if store.readCount == 2 && store.secondRead != nil {
+		return append([]byte(nil), store.secondRead...), nil
+	}
+	return store.MemoryStore.Read(path)
 }
 
 func eppStore(files map[string]string) *testkit.MemoryStore {

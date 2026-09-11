@@ -41,6 +41,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	var current []string
 	var revisionPaths []string
 	performanceGovernorBlocked := false
+	policyStateUnverified := false
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -50,15 +51,18 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		}
 		base := eppRoot + "/" + entry
 		revisionPaths = append(revisionPaths, base+"/energy_performance_available_preferences", base+"/energy_performance_preference", base+"/scaling_governor", base+"/scaling_driver")
+		scalingDriver, scalingDriverErr := driver.store.Read(base + "/scaling_driver")
+		scalingGovernor, scalingGovernorErr := driver.store.Read(base + "/scaling_governor")
+		if scalingDriverErr != nil || scalingGovernorErr != nil {
+			policyStateUnverified = true
+		} else if strings.TrimSpace(string(scalingDriver)) == "intel_pstate" && strings.TrimSpace(string(scalingGovernor)) == "performance" {
+			performanceGovernorBlocked = true
+		}
 		availableRaw, availableErr := driver.store.Read(base + "/energy_performance_available_preferences")
 		currentRaw, currentErr := driver.store.Read(base + "/energy_performance_preference")
 		if availableErr != nil || currentErr != nil {
+			policyStateUnverified = true
 			continue
-		}
-		scalingDriver, scalingDriverErr := driver.store.Read(base + "/scaling_driver")
-		scalingGovernor, scalingGovernorErr := driver.store.Read(base + "/scaling_governor")
-		if scalingDriverErr == nil && scalingGovernorErr == nil && strings.TrimSpace(string(scalingDriver)) == "intel_pstate" && strings.TrimSpace(string(scalingGovernor)) == "performance" {
-			performanceGovernorBlocked = true
 		}
 		available := strings.Fields(string(availableRaw))
 		if len(available) == 0 {
@@ -83,14 +87,18 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 
 	state := tuning.StateSupported
 	reasonCode, reason := "", ""
-	if len(common) == 0 {
-		state = tuning.StateKernelBlocked
-		reasonCode = "no_common_preference"
-		reason = "CPU policies do not expose a common energy preference"
-	} else if performanceGovernorBlocked {
+	if performanceGovernorBlocked {
 		state = tuning.StateKernelBlocked
 		reasonCode = "intel_pstate_performance_governor"
 		reason = "intel_pstate performance mode rejects energy-preference changes; select a balanced system power profile first"
+	} else if policyStateUnverified {
+		state = tuning.StateKernelBlocked
+		reasonCode = "policy_state_unverified"
+		reason = "CPU policy driver or governor state could not be verified; energy-preference editing is disabled"
+	} else if len(common) == 0 {
+		state = tuning.StateKernelBlocked
+		reasonCode = "no_common_preference"
+		reason = "CPU policies do not expose a common energy preference"
 	}
 	currentChoice := current[0]
 	for _, choice := range current[1:] {
