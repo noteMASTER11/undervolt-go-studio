@@ -189,11 +189,13 @@ func (m *Monitor) stateLocked() MonitorState {
 		Current:  make(map[telemetry.MetricID]telemetry.Sample, len(m.current)),
 		History:  make(map[telemetry.MetricID][]telemetry.Sample, len(m.histories)),
 	}
-	for metricID, sample := range m.current {
-		state.Current[metricID] = sample
-	}
-	for metricID, ring := range m.histories {
-		state.History[metricID] = ring.Snapshot()
+	for _, metricID := range m.metricIDs {
+		if sample, exists := m.current[metricID]; exists {
+			state.Current[metricID] = sample
+		}
+		if ring := m.histories[metricID]; ring != nil {
+			state.History[metricID] = history.DownsampleMinMax(ring.Snapshot(), 240)
+		}
 	}
 	return state
 }

@@ -27,3 +27,16 @@ func TestTimelineCopiesSeriesInput(t *testing.T) {
 		t.Fatal("Series returned internal storage")
 	}
 }
+
+func TestTimelinePrecomputesBoundsBeforePaint(t *testing.T) {
+	timeline := NewTimeline()
+	timeline.SetSeries([]Series{{Points: []telemetry.Sample{{Value: 8}, {Value: 2}, {Value: 11}}}})
+	timeline.mu.RLock()
+	defer timeline.mu.RUnlock()
+	if got := len(timeline.render); got != 1 {
+		t.Fatalf("render series = %d", got)
+	}
+	if timeline.render[0].minimum != 2 || timeline.render[0].maximum != 11 {
+		t.Fatalf("bounds = %v..%v", timeline.render[0].minimum, timeline.render[0].maximum)
+	}
+}

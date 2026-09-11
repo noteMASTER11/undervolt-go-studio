@@ -115,3 +115,21 @@ func TestMonitorPublishesCopiedStateFromFrames(t *testing.T) {
 		t.Fatal("timed out waiting for state")
 	}
 }
+
+func TestMonitorStateExcludesDeselectedHistory(t *testing.T) {
+	source := &fakeSource{}
+	vm := NewMonitor(source, 250*time.Millisecond)
+	vm.SetMetricIDs([]telemetry.MetricID{"a", "b"})
+	vm.current["a"] = telemetry.Sample{MetricID: "a", Value: 1}
+	vm.current["b"] = telemetry.Sample{MetricID: "b", Value: 2}
+	vm.histories["a"].Append(vm.current["a"])
+	vm.histories["b"].Append(vm.current["b"])
+	vm.SetMetricIDs([]telemetry.MetricID{"b"})
+	state := vm.State()
+	if _, exists := state.Current["a"]; exists {
+		t.Fatal("deselected current value was copied")
+	}
+	if _, exists := state.History["a"]; exists {
+		t.Fatal("deselected history was copied")
+	}
+}

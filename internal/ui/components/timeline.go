@@ -22,7 +22,14 @@ type Series struct {
 type Timeline struct {
 	mu     sync.RWMutex
 	series []Series
+	render []renderSeries
 	raster *canvas.Raster
+}
+
+type renderSeries struct {
+	series  Series
+	minimum float64
+	maximum float64
 }
 
 func NewTimeline() *Timeline {
@@ -35,8 +42,25 @@ func NewTimeline() *Timeline {
 func (t *Timeline) Object() fyne.CanvasObject { return t.raster }
 
 func (t *Timeline) SetSeries(series []Series) {
+	cloned := cloneSeries(series)
+	render := make([]renderSeries, 0, len(cloned))
+	for _, item := range cloned {
+		if len(item.Points) == 0 {
+			continue
+		}
+		minimum, maximum := item.Points[0].Value, item.Points[0].Value
+		for _, point := range item.Points[1:] {
+			minimum = math.Min(minimum, point.Value)
+			maximum = math.Max(maximum, point.Value)
+		}
+		if maximum == minimum {
+			maximum = minimum + 1
+		}
+		render = append(render, renderSeries{series: item, minimum: minimum, maximum: maximum})
+	}
 	t.mu.Lock()
-	t.series = cloneSeries(series)
+	t.series = cloned
+	t.render = render
 	t.mu.Unlock()
 	t.raster.Refresh()
 }
@@ -57,20 +81,13 @@ func (t *Timeline) pixel(x, y, width, height int) color.Color {
 	if x%80 == 0 || y%55 == 0 {
 		background = color.NRGBA{R: 38, G: 45, B: 55, A: 255}
 	}
-	for _, series := range t.series {
+	for _, render := range t.render {
+		series := render.series
 		if len(series.Points) < 2 {
 			continue
 		}
-		minimum, maximum := series.Points[0].Value, series.Points[0].Value
-		for _, point := range series.Points[1:] {
-			minimum = math.Min(minimum, point.Value)
-			maximum = math.Max(maximum, point.Value)
-		}
-		if maximum == minimum {
-			maximum = minimum + 1
-		}
 		pointIndex := int(float64(x) / float64(width-1) * float64(len(series.Points)-1))
-		expectedY := height - 1 - int((series.Points[pointIndex].Value-minimum)/(maximum-minimum)*float64(height-1))
+		expectedY := height - 1 - int((series.Points[pointIndex].Value-render.minimum)/(render.maximum-render.minimum)*float64(height-1))
 		if abs(y-expectedY) <= 1 {
 			return series.Color
 		}
