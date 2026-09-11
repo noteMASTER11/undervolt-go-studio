@@ -52,7 +52,7 @@ go run ./cmd/ui-snapshot --page tune --scenario intel-275hx --output build/tune-
 
 Screenshot: `build/tune-275hx.png` (1600 × 1000).
 
-The deterministic `intel-275hx` scenario renders PL1/PL2 at 44 W, a 95 °C thermal ceiling, EPP choices, a supported P-core ratio vector, and a firmware-locked core voltage control using the injected Tune service. The snapshot path does not construct or call the `pkexec` client.
+The deterministic `intel-275hx` scenario renders PL1/PL2 at 44 W, a 95 °C thermal ceiling, EPP choices, a supported P-core ratio vector, and a firmware-locked core voltage control using the injected Tune service. The locked-voltage capability deliberately leaves `Current` unset and omits `Range`; the primary UI therefore does not imply that a 0 mV value is available. The Tune capture waits for completed discovery after its final state has rendered, rather than sleeping for a fixed interval. The snapshot path does not construct or call the `pkexec` client.
 
 Visual inspection using the local image viewer found readable labels and disabled states, no overlapping cards, no clipped labels, a visible Pending changes rail, and no raw technical data in the primary view. The lower control cards remain accessible through the visible content scrollbar. The Fyne runtime emitted a non-fatal locale-`C` parsing diagnostic while rendering; the command still exited 0 and produced the PNG.
 
