@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -40,6 +41,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	var common []string
 	var current []string
 	var revisionPaths []string
+	sawEPPInterface := false
 	performanceGovernorBlocked := false
 	policyStateUnverified := false
 	for _, entry := range entries {
@@ -53,19 +55,29 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		revisionPaths = append(revisionPaths, base+"/energy_performance_available_preferences", base+"/energy_performance_preference", base+"/scaling_governor", base+"/scaling_driver")
 		scalingDriver, scalingDriverErr := driver.store.Read(base + "/scaling_driver")
 		scalingGovernor, scalingGovernorErr := driver.store.Read(base + "/scaling_governor")
+		availableRaw, availableErr := driver.store.Read(base + "/energy_performance_available_preferences")
+		currentRaw, currentErr := driver.store.Read(base + "/energy_performance_preference")
+		if errors.Is(availableErr, os.ErrNotExist) && errors.Is(currentErr, os.ErrNotExist) {
+			continue
+		}
+		sawEPPInterface = true
 		if scalingDriverErr != nil || scalingGovernorErr != nil {
 			policyStateUnverified = true
 		} else if strings.TrimSpace(string(scalingDriver)) == "intel_pstate" && strings.TrimSpace(string(scalingGovernor)) == "performance" {
 			performanceGovernorBlocked = true
 		}
-		availableRaw, availableErr := driver.store.Read(base + "/energy_performance_available_preferences")
-		currentRaw, currentErr := driver.store.Read(base + "/energy_performance_preference")
 		if availableErr != nil || currentErr != nil {
 			policyStateUnverified = true
 			continue
 		}
 		available := strings.Fields(string(availableRaw))
 		if len(available) == 0 {
+			policyStateUnverified = true
+			continue
+		}
+		currentChoice := strings.TrimSpace(string(currentRaw))
+		if currentChoice == "" {
+			policyStateUnverified = true
 			continue
 		}
 		if common == nil {
@@ -74,9 +86,9 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 			common = intersect(common, available)
 		}
 		policies = append(policies, base+"/energy_performance_preference")
-		current = append(current, strings.TrimSpace(string(currentRaw)))
+		current = append(current, currentChoice)
 	}
-	if len(policies) == 0 {
+	if len(policies) == 0 && !sawEPPInterface {
 		return nil, nil
 	}
 	sort.Strings(policies)
@@ -94,18 +106,22 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 	} else if policyStateUnverified {
 		state = tuning.StateKernelBlocked
 		reasonCode = "policy_state_unverified"
-		reason = "CPU policy driver or governor state could not be verified; energy-preference editing is disabled"
+		reason = "CPU policy or energy-preference state could not be verified; editing is disabled"
 	} else if len(common) == 0 {
 		state = tuning.StateKernelBlocked
 		reasonCode = "no_common_preference"
 		reason = "CPU policies do not expose a common energy preference"
 	}
-	currentChoice := current[0]
-	for _, choice := range current[1:] {
-		if choice != currentChoice {
-			currentChoice = "mixed"
-			break
+	var currentValue tuning.Value
+	if len(current) > 0 {
+		currentChoice := current[0]
+		for _, choice := range current[1:] {
+			if choice != currentChoice {
+				currentChoice = "mixed"
+				break
+			}
 		}
+		currentValue = tuning.ChoiceValue(currentChoice)
 	}
 	return []tuning.Capability{{
 		SourceRevision:    sysfs.Revision(driver.store, revisionPaths...),
@@ -114,7 +130,7 @@ func (driver *Driver) Probe(ctx context.Context) ([]tuning.Capability, error) {
 		Label:             "Energy preference",
 		Unit:              tuning.UnitChoice,
 		State:             state,
-		Current:           tuning.ChoiceValue(currentChoice),
+		Current:           currentValue,
 		Choices:           append([]string(nil), common...),
 		DriverID:          driver.ID(),
 		ReasonCode:        reasonCode,

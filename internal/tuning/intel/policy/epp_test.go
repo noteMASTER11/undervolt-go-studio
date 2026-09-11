@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 
@@ -160,6 +161,96 @@ func TestEPPFailsClosedWhenAnyPolicyPreferenceCannotBeRead(t *testing.T) {
 	capability := capabilities[0]
 	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" {
 		t.Fatalf("partial-policy capability = %+v", capability)
+	}
+}
+
+func TestEPPFailsClosedWhenAnyPolicyHasEmptyAvailablePreferences(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+		"policy8/energy_performance_available_preferences": "\n",
+		"policy8/energy_performance_preference":            "default\n",
+		"policy8/scaling_driver":                           "intel_pstate\n",
+		"policy8/scaling_governor":                         "powersave\n",
+	})
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" {
+		t.Fatalf("empty-available capability = %+v", capability)
+	}
+}
+
+func TestEPPFailsClosedWhenAnyPolicyHasEmptyCurrentPreference(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+		"policy8/energy_performance_available_preferences": "default performance power\n",
+		"policy8/energy_performance_preference":            "\n",
+		"policy8/scaling_driver":                           "intel_pstate\n",
+		"policy8/scaling_governor":                         "powersave\n",
+	})
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" {
+		t.Fatalf("empty-current capability = %+v", capability)
+	}
+}
+
+func TestEPPReportsBlockedWhenAllPolicyPreferencesAreUnreadable(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/energy_performance_available_preferences": "default performance power\n",
+		"policy0/energy_performance_preference":            "default\n",
+		"policy0/scaling_driver":                           "intel_pstate\n",
+		"policy0/scaling_governor":                         "powersave\n",
+	})
+	store.Fail("read", eppRoot+"/policy0/energy_performance_available_preferences", errors.New("permission denied"))
+	store.Fail("read", eppRoot+"/policy0/energy_performance_preference", errors.New("permission denied"))
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 1 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+	capability := capabilities[0]
+	if capability.State != tuning.StateKernelBlocked || capability.ReasonCode != "policy_state_unverified" || capability.Current.Kind != "" {
+		t.Fatalf("all-unreadable capability = %+v", capability)
+	}
+}
+
+func TestEPPIsAbsentWhenNoPolicyExposesTheInterface(t *testing.T) {
+	store := eppStore(map[string]string{
+		"policy0/scaling_driver":   "intel_pstate\n",
+		"policy0/scaling_governor": "performance\n",
+	})
+	store.Fail("read", eppRoot+"/policy0/energy_performance_available_preferences", os.ErrNotExist)
+	store.Fail("read", eppRoot+"/policy0/energy_performance_preference", os.ErrNotExist)
+
+	capabilities, err := New(store).Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities) != 0 {
+		t.Fatalf("absent EPP interface produced capabilities: %#v", capabilities)
 	}
 }
 
