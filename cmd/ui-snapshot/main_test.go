@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"image/png"
 	"os"
 	"os/exec"
@@ -16,6 +17,22 @@ import (
 	"github.com/noteMASTER11/undervolt-go-studio/internal/tuning"
 	"github.com/noteMASTER11/undervolt-go-studio/internal/ui/viewmodel"
 )
+
+func TestSnapshotReadinessWaitsForDefaultHardwareSummary(t *testing.T) {
+	want := errors.New("summary still loading")
+	called := false
+	wait := snapshotReadiness("hardware", func(context.Context) error {
+		called = true
+		return want
+	})
+
+	if err := wait(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("hardware readiness error = %v, want %v", err, want)
+	}
+	if !called {
+		t.Fatal("hardware readiness did not wait for the selected page summary")
+	}
+}
 
 func TestIntel275HXSnapshotServiceReportsRequiredCapabilitiesHonestly(t *testing.T) {
 	results := intel275HXSnapshotService{}.Discover(context.Background())

@@ -63,6 +63,9 @@ func TestShellUsesConcreteLivePagesAndKeepsMonitorLazy(t *testing.T) {
 	if _, ok := shell.navigator.pages["hardware"].(*pages.Hardware); !ok {
 		t.Fatalf("hardware type = %T", shell.navigator.pages["hardware"])
 	}
+	if shell.hardware == nil {
+		t.Fatal("selected Hardware page is not available to readiness waits")
+	}
 }
 
 func TestShellConstructsTuneLazily(t *testing.T) {

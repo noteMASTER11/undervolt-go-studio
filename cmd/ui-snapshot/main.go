@@ -92,8 +92,13 @@ func createSnapshotPage(page, scenario string) (*snapshotPageResult, error) {
 
 func stopSnapshot(snapshot *snapshotPageResult) {
 	fyne.DoAndWait(snapshot.deactivate)
-	// Drain callbacks that were queued before the dispatchers were cancelled.
-	fyne.DoAndWait(func() {})
+}
+
+func snapshotReadiness(page string, hardwareWait func(context.Context) error) func(context.Context) error {
+	if page == "hardware" {
+		return hardwareWait
+	}
+	return func(context.Context) error { return nil }
 }
 
 type snapshotPageResult struct {
@@ -128,7 +133,7 @@ func snapshotPage(page, scenario string) (*snapshotPageResult, error) {
 	return &snapshotPageResult{
 		object:     shell.Object(),
 		deactivate: shell.Deactivate,
-		wait:       func(context.Context) error { return nil },
+		wait:       snapshotReadiness(page, shell.WaitForHardwareSummary),
 	}, nil
 }
 

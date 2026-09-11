@@ -88,7 +88,10 @@ func newShell(info product.Info, scheduler *telemetry.Scheduler, eventStore *eve
 		placeholderFactory("stress", "Stress Tests", theme.MediaPlayIcon(), "Stress engines are delivered in a later milestone."),
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
 		placeholderFactory("reports", "Reports", theme.DocumentIcon(), "Reports are delivered after session recording."),
-		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page { return pages.NewHardware(info, scheduler, shell.catalog) }},
+		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page {
+			shell.hardware = pages.NewHardware(info, scheduler, shell.catalog)
+			return shell.hardware
+		}},
 		{ID: "logs", Label: "Logs", Icon: theme.ListIcon(), Create: func() Page { return pages.NewLogs(shell.events) }},
 	}
 	shell.navigator = NewLazyNavigator(factories)
