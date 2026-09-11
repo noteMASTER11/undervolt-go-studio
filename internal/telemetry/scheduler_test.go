@@ -105,6 +105,34 @@ func TestSlowProviderDoesNotBlockFastProvider(t *testing.T) {
 	}
 }
 
+func TestProviderFailurePublishesUnavailableSamples(t *testing.T) {
+	provider := fake.New(fake.Options{ProviderID: "failing", MetricCount: 1, FailEvery: 2})
+	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, testOptions())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := scheduler.Discover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.Start(ctx)
+	handle := scheduler.Subscribe(telemetry.Subscription{
+		ConsumerID: "monitor", MetricIDs: []telemetry.MetricID{"failing.metric.0"}, Interval: time.Millisecond,
+	})
+	defer handle.Close()
+	select {
+	case <-handle.Frames():
+	case <-time.After(time.Second):
+		t.Fatal("no initial frame")
+	}
+	select {
+	case frame := <-handle.Frames():
+		if len(frame.Samples) != 1 || frame.Samples[0].Quality != telemetry.QualityUnavailable || frame.Samples[0].Error == "" {
+			t.Fatalf("failure frame = %+v", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("provider failure was not published")
+	}
+}
+
 func TestHandleCloseIsIdempotentAndStopsDemand(t *testing.T) {
 	provider := fake.New(fake.Options{ProviderID: "fake", MetricCount: 1})
 	scheduler := telemetry.NewScheduler([]telemetry.Provider{provider}, testOptions())

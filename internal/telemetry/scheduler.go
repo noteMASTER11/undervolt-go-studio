@@ -270,6 +270,16 @@ func (s *Scheduler) runProvider(ctx context.Context, runtime *providerRuntime) {
 				diagnostics.LastError = err.Error()
 				diagnostics.LastLatency = latency
 			})
+			failure := Frame{
+				ProviderID: runtime.provider.ID(), StartedAt: started, FinishedAt: time.Now(),
+				Samples: make([]Sample, 0, len(metricIDs)),
+			}
+			for _, metricID := range metricIDs {
+				failure.Samples = append(failure.Samples, Sample{
+					MetricID: metricID, Timestamp: started, Quality: QualityUnavailable, Error: err.Error(),
+				})
+			}
+			s.publish(runtime, failure)
 			if !waitForWake(ctx, runtime.wake, backoff) {
 				runtime.update(func(diagnostics *ProviderDiagnostics) { diagnostics.State = "stopped" })
 				return
