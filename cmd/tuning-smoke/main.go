@@ -114,6 +114,8 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 		report.TopologyError = topologyErr.Error()
 	}
 	var engine *tuning.Engine
+	var capabilities tuning.CapabilitySet
+	var probeErr error
 	if config.Mutate {
 		bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 		if err != nil {
@@ -121,11 +123,16 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 		}
 		engine = tuning.NewEngine(tuning.CapabilitySet{MachineID: machineID}, tuning.FileRecoveryStore{}, drivers...)
 		engine.BootID = strings.TrimSpace(string(bootID))
-		if err := recoverBeforeMutation(context.Background(), engine, &report, config.Output); err != nil {
-			return err
+		var recoveryErr error
+		capabilities, probeErr, recoveryErr = hydrateRecoverAndRediscover(context.Background(), engine, func(ctx context.Context) (tuning.CapabilitySet, error) {
+			return discover(ctx, discoverer)
+		}, &report, config.Output)
+		if recoveryErr != nil {
+			return recoveryErr
 		}
+	} else {
+		capabilities, probeErr = discover(context.Background(), discoverer)
 	}
-	capabilities, probeErr := discover(context.Background(), discoverer)
 	report.Capabilities = capabilities
 	if probeErr != nil {
 		report.ProbeError = probeErr.Error()
@@ -160,7 +167,8 @@ func run(arguments []string, stdout io.Writer, euid func() int) error {
 }
 
 func recoverBeforeMutation(ctx context.Context, engine *tuning.Engine, report *smokeReport, output string) error {
-	if _, err := engine.Recover(ctx); err != nil {
+	result, err := engine.Recover(ctx)
+	if err = errors.Join(err, unresolvedRecoveryError(result)); err != nil {
 		report.RecoveryError = err.Error()
 		if reportErr := emitReport(io.Discard, output, *report); reportErr != nil {
 			return errors.Join(fmt.Errorf("recover previous mutation: %w", err), fmt.Errorf("persist recovery failure report: %w", reportErr))
@@ -168,6 +176,31 @@ func recoverBeforeMutation(ctx context.Context, engine *tuning.Engine, report *s
 		return fmt.Errorf("recover previous mutation: %w", err)
 	}
 	return nil
+}
+
+func unresolvedRecoveryError(result tuning.RecoveryResult) error {
+	var problems []string
+	if result.StaleBoot {
+		problems = append(problems, "stale boot")
+	}
+	problems = append(problems, result.Discrepancies...)
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("recovery is unresolved: %s", strings.Join(problems, "; "))
+}
+
+func hydrateRecoverAndRediscover(ctx context.Context, engine *tuning.Engine, rediscover func(context.Context) (tuning.CapabilitySet, error), report *smokeReport, output string) (tuning.CapabilitySet, error, error) {
+	hydrated, hydrationErr := rediscover(ctx)
+	engine.Capabilities = hydrated
+	report.Capabilities = hydrated
+	if recoveryErr := recoverBeforeMutation(ctx, engine, report, output); recoveryErr != nil {
+		return hydrated, hydrationErr, recoveryErr
+	}
+	stock, stockErr := rediscover(ctx)
+	engine.Capabilities = stock
+	report.Capabilities = stock
+	return stock, errors.Join(hydrationErr, stockErr), nil
 }
 
 func validateMutationGate(mutate bool, confirmation string, identity intel.Identity) error {

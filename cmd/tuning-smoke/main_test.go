@@ -75,6 +75,82 @@ func TestRecoveryFailurePersistsReportBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestMutationSetupHydratesRecoveryBeforeFreshStockRediscovery(t *testing.T) {
+	var order []string
+	store := &orderedRecoveryStore{order: &order}
+	engine := tuning.NewEngine(tuning.CapabilitySet{MachineID: "test-machine"}, store)
+	store.engine = engine
+	engine.BootID = "boot"
+	hydrated := tuning.CapabilitySet{Generation: "hydrated", MachineID: "test-machine"}
+	stock := tuning.CapabilitySet{Generation: "stock", MachineID: "test-machine"}
+	discoveries := 0
+
+	got, probeErr, recoveryErr := hydrateRecoverAndRediscover(context.Background(), engine, func(context.Context) (tuning.CapabilitySet, error) {
+		discoveries++
+		if discoveries == 1 {
+			order = append(order, "hydrate")
+			return hydrated, nil
+		}
+		order = append(order, "stock")
+		return stock, nil
+	}, &smokeReport{}, "")
+	if probeErr != nil || recoveryErr != nil {
+		t.Fatalf("prepare mutation probe=%v recovery=%v", probeErr, recoveryErr)
+	}
+	if got.Generation != "stock" || engine.Capabilities.Generation != "stock" {
+		t.Fatalf("stock=%q engine=%q, want fresh stock capabilities", got.Generation, engine.Capabilities.Generation)
+	}
+	if gotOrder := strings.Join(order, ","); gotOrder != "hydrate,recover,stock" {
+		t.Fatalf("order=%q", gotOrder)
+	}
+	if store.capabilitiesAtRecovery != "hydrated" {
+		t.Fatalf("recovery capabilities=%q, want hydrated", store.capabilitiesAtRecovery)
+	}
+}
+
+func TestUnresolvedRecoveryResultPersistsFailureAndBlocksMutation(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "reports", "stale-recovery.json")
+	store := &staleRecoveryStore{record: tuning.RecoveryRecord{
+		Protocol:  tuning.RecoveryProtocol,
+		MachineID: "test-machine",
+		BootID:    "previous-boot",
+		Entries:   []tuning.RecoveryEntry{{ControlID: tuning.ControlPL1, Applied: true}},
+	}}
+	engine := tuning.NewEngine(tuning.CapabilitySet{MachineID: "test-machine"}, store)
+	engine.BootID = "current-boot"
+	report := smokeReport{Mode: "conservative-mutation"}
+
+	err := recoverBeforeMutation(context.Background(), engine, &report, output)
+	if err == nil || !strings.Contains(err.Error(), "stale boot") {
+		t.Fatalf("recovery error=%v", err)
+	}
+	encoded, readErr := os.ReadFile(output)
+	if readErr != nil {
+		t.Fatalf("read recovery report: %v", readErr)
+	}
+	var saved smokeReport
+	if err := json.Unmarshal(encoded, &saved); err != nil {
+		t.Fatalf("decode recovery report: %v", err)
+	}
+	if !strings.Contains(saved.RecoveryError, "stale boot") || !strings.Contains(saved.RecoveryError, string(tuning.ControlPL1)) {
+		t.Fatalf("unresolved recovery was not persisted: %+v", saved)
+	}
+}
+
+func TestRecoveryResultIsUnresolvedForStaleBootOrDiscrepancy(t *testing.T) {
+	for _, result := range []tuning.RecoveryResult{
+		{StaleBoot: true},
+		{Discrepancies: []string{"intel.package.pl1 requires an audit"}},
+	} {
+		if err := unresolvedRecoveryError(result); err == nil {
+			t.Fatalf("result=%+v was accepted", result)
+		}
+	}
+	if err := unresolvedRecoveryError(tuning.RecoveryResult{}); err != nil {
+		t.Fatalf("resolved recovery rejected: %v", err)
+	}
+}
+
 func TestExerciseCaseDefersRollbackAfterApplyPanic(t *testing.T) {
 	driver := &exerciseCaseTestDriver{}
 	capabilities := exerciseCaseTestCapabilities(driver.ID())
@@ -117,6 +193,26 @@ func (store recoveryFailureStore) Load() (tuning.RecoveryRecord, error) {
 }
 func (recoveryFailureStore) Save(tuning.RecoveryRecord) error { return nil }
 func (recoveryFailureStore) Remove() error                    { return nil }
+
+type orderedRecoveryStore struct {
+	order                  *[]string
+	engine                 *tuning.Engine
+	capabilitiesAtRecovery string
+}
+
+func (store *orderedRecoveryStore) Load() (tuning.RecoveryRecord, error) {
+	*store.order = append(*store.order, "recover")
+	store.capabilitiesAtRecovery = store.engine.Capabilities.Generation
+	return tuning.RecoveryRecord{}, os.ErrNotExist
+}
+func (*orderedRecoveryStore) Save(tuning.RecoveryRecord) error { return nil }
+func (*orderedRecoveryStore) Remove() error                    { return nil }
+
+type staleRecoveryStore struct{ record tuning.RecoveryRecord }
+
+func (store *staleRecoveryStore) Load() (tuning.RecoveryRecord, error) { return store.record, nil }
+func (*staleRecoveryStore) Save(tuning.RecoveryRecord) error           { return nil }
+func (*staleRecoveryStore) Remove() error                              { return nil }
 
 type exerciseCaseRecoveryStore struct{}
 
