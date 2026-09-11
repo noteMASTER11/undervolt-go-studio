@@ -37,7 +37,7 @@ func NewShell(info product.Info, scheduler *telemetry.Scheduler) *Shell {
 		placeholderFactory("stress", "Stress Tests", theme.MediaPlayIcon(), "Stress engines are delivered in a later milestone."),
 		placeholderFactory("profiles", "Profiles", theme.StorageIcon(), "Profile editing is delivered with privileged tuning."),
 		placeholderFactory("reports", "Reports", theme.DocumentIcon(), "Reports are delivered after session recording."),
-		placeholderFactory("hardware", "Hardware", theme.ComputerIcon(), "Provider diagnostics are not connected yet."),
+		{ID: "hardware", Label: "Hardware", Icon: theme.ComputerIcon(), Create: func() Page { return pages.NewHardware(info, scheduler, shell.catalog) }},
 		placeholderFactory("logs", "Logs", theme.ListIcon(), "No Studio events have been recorded."),
 	}
 	shell.navigator = NewLazyNavigator(factories)
