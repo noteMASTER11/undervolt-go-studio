@@ -23,6 +23,9 @@ func TestEngineAppliesSafeOrderAndRollsBackReverseOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if active.ID() == "" {
+		t.Fatal("active transaction has no ID")
+	}
 	if err := active.Rollback(context.Background()); err != nil {
 		t.Fatal(err)
 	}

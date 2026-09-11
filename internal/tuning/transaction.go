@@ -41,6 +41,10 @@ type ActiveTransaction struct {
 	finished bool
 }
 
+func (active *ActiveTransaction) ID() string {
+	return active.record.TransactionID
+}
+
 func (engine *Engine) Apply(ctx context.Context, changes ChangeSet) (*ActiveTransaction, ValidationResult, error) {
 	validation, err := ValidateChangeSet(engine.Capabilities, changes)
 	if err != nil {
