@@ -1,4 +1,4 @@
-module undervolt-go
+module github.com/noteMASTER11/undervolt-go-studio
 
 go 1.24.1
 

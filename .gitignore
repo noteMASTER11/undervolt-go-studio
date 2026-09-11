@@ -3,6 +3,7 @@
 fyne
 fyne-cross/
 bin/
+/build/
 
 # Package outputs
 *.tar.xz

@@ -1,4 +1,6 @@
-# Undervolt Go
+# Undervolt Go Studio
+
+> **Development status:** This repository is the experimental Undervolt Go Studio fork of [Softorage/undervolt-go](https://github.com/Softorage/undervolt-go). It retains the upstream history and GPL-3.0 license while developing an unprivileged, asynchronous monitoring and tuning workstation for Linux. The original Undervolt Go interface described below remains available during the migration.
 
 **Undervolt Go** is a power-utility, designed to allow users to undervolt Intel CPUs on Linux systems. Undervolting can help reduce CPU temperatures, decrease power consumption, and potentially increase system stability and longevity. **Undervolt Go** gives the advantage of running the application without the need for any dependencies, and also features a user-friendly graphical version.
 
